@@ -1,57 +1,80 @@
 # emacs-dsh
 
-一个面向**正在运行的 DeepSeek Harness Web Host** 的 Emacs 客户端。借鉴 [pimacs.el](https://github.com/ananthakumaran/pimacs.el) 的 Emacs 对话交互，但直接使用 DSH 的 Connection RPC + Gateway Remote Stream 协议，**不依赖 Pi，也不另起一个 DSH 后端**。参考了用户 WSL Emacs 配置的「选目录后总是新会话」「独立恢复旧会话」「顶部钉住上一条 prompt」「@ 文件引用」「WSL 路径映射」设计。
+emacs-dsh 是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的 Emacs 客户端。它参考了 [pimacs.el](https://github.com/ananthakumaran/pimacs.el) 的对话方式，连接**已经运行的 DSH Web Host**，在 Emacs 中创建、恢复和使用 Host 保存的会话，不会另起一个 Harness 后端。
 
-> 状态：可加载和测试的初版。需在已开启 Web Host 的 DSH 上使用；`dsh web` 的启动 URL（含 `?token=`）用于首次鉴权。尚未对真实 Host 执行端到端发送测试，因为当前会话没有提供其启动令牌。
+首次使用需在 DSH Host 中安装并启用本仓库的 `host-bridge` 插件。此后 Emacs 会自动发现本机 Host 并完成鉴权；打开聊天时无需输入用户名、密码或粘贴令牌。**Host 进程必须保持运行**，但不必一直打开 DSH Desktop 窗口：也可以运行配置了同一 bridge 的 `dsh web --no-open`。
+
+## 环境要求
+
+- Emacs 29.1+，以及已配置可用模型的 DSH Web Host。
+- `websocket.el` 是 Emacs 包依赖，已写入 `emacs-dsh.el` 的 `Package-Requires`。通过 Emacs 包管理器安装本插件时会安装依赖；若直接把源码放进 `load-path`，需确保 Emacs 已能加载 `websocket`。
+- Emacs 与 Host 在同一台机器上。本插件只连接 bridge 公布的 `127.0.0.1` 地址。Windows Host + WSL Emacs、原生 macOS Emacs 使用同一客户端；两者的本机鉴权方式见下文。
 
 ## 安装
 
-Emacs 29.1+，依赖 [websocket.el](https://github.com/ahyatt/emacs-websocket)。`:vc` 关键字需要 Emacs 30+ 内置的 `use-package-vc`（Emacs 29 可另装 `use-package-vc`）。例如：
+1. 在**正在使用的 DSH Host profile** 中，通过 DSH Plugins 界面安装本仓库的 `host-bridge` 目录并启用它，然后重启 Host。使用 Desktop profile 的 CLI 示例：`dsh plugin --profile desktop add ./host-bridge`。若使用 `dsh web`，请把 bridge 安装在对应的 Web profile。
+2. 确认 bridge 文件已生成：Windows 为 `%USERPROFILE%/.dsh/emacs-dsh-bridge.json`；macOS 默认为 `~/.dsh/emacs-dsh-bridge.json`。如果 Host 设置了 `DSH_HOME`，文件位于该目录下。**不要把 bridge 文件提交到 Git。**
+3. 安装 Emacs 客户端。使用包管理器安装本仓库后，可加入以下配置；`<f7>` 是示例快捷键，可按需修改：
 
 ```elisp
-(use-package websocket :ensure t)
 (use-package emacs-dsh
-  :vc (:url "https://github.com/wowhxj/emacs-dsh" :rev newest)
-  :after websocket
-  :commands (emacs-dsh-chat emacs-dsh-connect emacs-dsh-resume)
-  :bind (("<f6>" . emacs-dsh-chat)
-         ("C-c p r" . emacs-dsh-resume))
-  :custom
-  (emacs-dsh-url "http://127.0.0.1:19387/")
-  :config
-  (when (getenv "WSL_DISTRO_NAME")
-    (setq emacs-dsh-wsl-path-function #'emacs-dsh-wsl-windows-path)))
+  :commands (emacs-dsh-chat emacs-dsh-resume emacs-dsh-connect)
+  :bind (("<f7>" . emacs-dsh-chat)
+         ("C-c C-r" . emacs-dsh-resume)))
 ```
 
-1. 打开正在运行的 DSH Web Host。拿到其启动时打印的完整 URL，例如 `http://127.0.0.1:19387/?token=...`。
-2. `M-x emacs-dsh-connect`，**临时粘贴**完整 URL；成功时取得签名 cookie。不要将 token 放进版本管理或长期配置。Emacs 默认 `url-cookie-file` 为 nil，不自动持久化 cookie；若你自行配置了持久化 cookie 文件，请把它按秘密文件保护。
-3. `<f6>` 选择 root 创建新会话；`C-c p r` 或 `C-c C-r` 浏览并恢复 Host 的会话（不会创建新会话）。
-4. 在底部输入框撰写，`C-c C-c` 发送；`C-c C-s` steer；`C-c C-k` 取消运行中的轮次；`C-c C-q` 关闭本地窗口。`C-c C-p` 智能粘贴文本/文件路径；`M-x emacs-dsh-insert-file` 插入文件引用；`M-x emacs-dsh-attach-image` 发送图片。
-
-会话在 DSH Host 持久化；关闭 Emacs buffer 不删除 Host 的会话。同一目录重复 `<f6>` 每次生成独立会话。上一条用户 prompt 显示在 header-line，运行状态显示在 tab-line。恢复时首先显示最近 `emacs-dsh-max-messages` 条消息，再通过 WebSocket 接收新增事件、自动重连；旧历史分页、工具输出详情和图片历史预览尚未做。
+开发时也可在上述配置中加入 `:load-path "/absolute/path/to/emacs-dsh"` 直接加载本仓库。源码直载不会替你安装包依赖，但**不需要**在配置里额外写一个 `use-package websocket` 声明。
 
 ### Windows Host + WSL Emacs
 
-用户的 WSL 配置会直接从 Windows 剪贴板读取文件列表及位图。当前初版的智能粘贴只处理 Emacs kill-ring 中可访问的文件路径；Windows 文件拖放/位图暂不支持自动粘贴，图片请用 `emacs-dsh-attach-image` 选择文件。**WSL Linux 路径必须转换成 Windows Host 可识别的路径**：
+bridge 将启动 URL 用当前 Windows 用户的 DPAPI 加密后保存。WSL Emacs 会通过 `powershell.exe` 解密，并用 `wslpath` 在 WSL 与 Windows 路径间转换；通常无需设置 `emacs-dsh-wsl-path-function`。用于新会话的目录必须是 Windows Host 可访问的目录，例如 `/mnt/d/project/`。
 
-```elisp
-(setq emacs-dsh-wsl-path-function #'emacs-dsh-wsl-windows-path)
-```
+### 原生 macOS Emacs
 
-例如 WSL 内 `/mnt/d/project/` 将通过 `wslpath -w` 转成 Windows 路径发送给 Host；无法访问的 WSL 专属路径不能用作 Windows 工作目录。恢复 Windows Host 的会话时若 `cwd` 不是 WSL 可访问路径，输入/显示依然可用，文件补全须选择本地可访问目录。
+Emacs 和 Host 直接使用 POSIX 路径，不需要 PowerShell 或 `wslpath`。bridge 在 macOS 上将启动 URL 写入本机文件，因此启用前要确保 DSH home 是当前用户专用目录，例如 `chmod 700 ~/.dsh`；bridge 文件以 `0600` 权限创建。若使用自定义 `DSH_HOME`，请让 Emacs 和 Host 使用同一个值。
 
-### 故障排查
+macOS 的代码路径已有回归测试，但目前尚未在真实 macOS Host 上完成端到端验证。
 
-- HTTP 401：重新执行 `emacs-dsh-connect`，并确保 URL 来自**当前进程**，Host/IP/端口一致。Cookie 会过期；Host 重启可能需要重新鉴权。
-- HTTP 403：检查 Host、Origin、网络配置；不要绕过 DSH 的 Host/Origin 防护。
-- WebSocket 断开会在约 3 秒后重连；浏览器页面和 Emacs 都应连接**同一个** DSH Web Host。
-- 没有可用模型时，先在 DSH GUI 选择、配置模型；本插件使用 Host 的会话默认模型。
+## 使用
 
-## 开发与测试
+| 操作 | 说明 |
+| --- | --- |
+| `M-x emacs-dsh-chat` 或 `<f7>` | 选择目录并创建新会话；同一目录再次启动仍会新建会话。 |
+| `C-c C-r` 或 `/resume` | 恢复 Host 保存的会话。列表按「创建时间、session ID、首句交互」三列对齐；首次打开会从会话快照读取创建时间。 |
+| `RET` 或 `C-c C-c` | 发送输入框中的消息。 |
+| `C-c C-s` / `C-c C-k` | 在运行中 steer / 取消当前轮次。 |
+| `C-c C-q` | 关闭当前 Emacs 聊天 buffer，不删除 Host 会话。 |
+| `TAB` | 补全 `/` 命令、技能或 `@` 文件引用。 |
+| `C-c C-p`、`s-v` 或 `s-V` | 智能粘贴文本、文件引用或图片附件。 |
+
+最近一条用户 query 固定显示在聊天窗口顶部。Emacs mode-line 显示会话 ID、运行状态、模型、思考程度和项目路径。新会话会自动读取 Host 的默认模型，无需先运行 `/model`。
+
+`/model` 可以从 Host 的模型列表选择，也支持 `/model provider/model`；`/reasoning` 可以选择当前模型支持的思考程度。输入 `/help` 可查看客户端命令及 Host 当时提供的命令。普通 Host 命令通过 `commands/list` 实时发现并交给 Host 执行；已注册的 `/skill-name` 作为 prompt 提交。未知命令会提示错误并保留草稿。
+
+输入 `@` 后按 `TAB` 可补全 Host 的文件引用；含空格的文件名会写成 `@"..."`。`M-x emacs-dsh-insert-file` 可手动插入引用，`M-x emacs-dsh-attach-image` 可暂存 PNG/JPEG/WebP/GIF 图片。智能粘贴在 WSL 下读取 Windows 剪贴板，在 macOS 下读取本机剪贴板：文件变成 `@` 引用，PNG/TIFF 图片变成下一次发送时附带的 PNG 附件。
+
+会话历史由 Host 保存。客户端初次加载最近 `emacs-dsh-max-messages` 条消息，随后通过 WebSocket 接收实时事件和重连。旧历史分页、图片历史预览、人工审批及交互式问答控件尚未实现；遇到需要审批或回答的轮次，请在 DSH Desktop/Web 中处理。
+
+## 连接与故障排查
+
+bridge 使用 Host 自身的 `connection.authenticatedUrl()`，不新增未鉴权 HTTP 接口。Windows 的 bridge 文件保存 DPAPI 密文；macOS 的 bridge 文件保存明文启动 URL，因此其目录和文件权限很重要。Emacs 会用该 URL 换取签名 cookie，cookie 失效时自动重新鉴权。`M-x emacs-dsh-connect` 可用于主动检查连接，日常聊天无需先运行它。
+
+- **找不到 bridge**：确认它安装在当前 Host profile、已启用，且 Host 已重启。仅在 Plugins 界面看到 active 状态不足以证明文件已生成。
+- **Host 关闭后无法连接**：保持 DSH Web Host 运行；若改用 `dsh web --no-open`，需要在其 profile 中启用 bridge。
+- **HTTP 401/403**：401 会自动尝试换新 cookie；反复失败时检查 bridge 是否属于当前 Host。403 请检查 Host/Origin 配置。
+- **路径或 `@` 引用不可用**：确认 Host 能访问所选项目目录。Windows Host 无法直接读取 WSL 专属的 Linux 路径。
+- **技能未出现**：技能由 DSH Host 发现，Emacs 只读取 Host 的 `skills/list`；检查 Host profile 的技能目录配置。
+
+## 开发验证
+
+把本仓库和已安装的 `websocket.el` 加入 Emacs 的 `load-path` 后运行：
 
 ```sh
 emacs -Q --batch -L /path/to/websocket-el -L . -f batch-byte-compile emacs-dsh.el
 emacs -Q --batch -L /path/to/websocket-el -L . -l tests.el -f ert-run-tests-batch-and-exit
+node --test host-bridge/tests.mjs
 ```
 
-协议参考：[DSH Session API](https://github.com/deepseek-ai/deepseek-harness/tree/main/packages/api/session-controller)、[Connection transport](https://github.com/deepseek-ai/deepseek-harness/tree/main/packages/client/connection)、[Gateway Remote stream](https://github.com/deepseek-ai/deepseek-harness/tree/main/packages/api/gateway)。Session 创建、列表、prompt、cancel 是 Host 的命名参数 RPC；`session/follow` 通过 `/api/remote.mux` WebSocket 流订阅。请勿把 [SDK stdio JSON-RPC](https://github.com/deepseek-ai/deepseek-harness/tree/main/packages/sdk/protocol) 与 Web Host RPC 混淆：前者会另启运行时且无法接入当前 GUI 会话。
+Host bridge 测试应分别在 Windows 和 POSIX 环境运行；Windows DPAPI 测试需使用运行 DSH 的 Windows 用户。当前 WSL/Windows 环境已通过 Emacs 测试及两侧的 Host bridge 测试，macOS 的真实 Host 与剪贴板行为仍待实机验证。
+
+协议参考：[Session Controller](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/api/session-controller)、[Connection](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/client/connection)、[API Gateway](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/api/gateway)。
