@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026
 ;; Author: emacs-dsh contributors
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (websocket "1.15"))
+;; Package-Requires: ((emacs "29.1") (websocket "1.15") (markdown-mode "2.3"))
 ;; Keywords: tools, processes, convenience
 ;; URL: https://github.com/wowhxj/emacs-dsh
 
@@ -22,6 +22,8 @@
 (require 'widget)
 (require 'wid-edit)
 (require 'websocket)
+(require 'markdown-mode)
+(require 'browse-url)
 
 (defgroup emacs-dsh nil "Emacs client for DeepSeek Harness." :group 'tools)
 (defface emacs-dsh-status-face
@@ -31,6 +33,28 @@
      :background "#29434b" :foreground "#e5f2ef")
     (t :inherit mode-line))
   "Face for the DSH mode-line status." :group 'emacs-dsh)
+(defface emacs-dsh-user-face
+  '((((class color) (background light)) :background "#edf5f4" :foreground "#244b48")
+    (((class color) (background dark)) :background "#263b3b" :foreground "#d9ebe8")
+    (t :inherit default))
+  "Face for user messages." :group 'emacs-dsh)
+(defface emacs-dsh-assistant-label-face
+  '((t :inherit font-lock-keyword-face :weight bold))
+  "Face for the assistant label." :group 'emacs-dsh)
+(defface emacs-dsh-tool-face
+  '((((class color) (background light)) :background "#eef1f7" :foreground "#34445e")
+    (((class color) (background dark)) :background "#2b3341" :foreground "#d5dfed")
+    (t :inherit default))
+  "Face for a tool call header." :group 'emacs-dsh)
+(defface emacs-dsh-tool-success-face
+  '((t :inherit success :weight bold))
+  "Face for a successful tool status." :group 'emacs-dsh)
+(defface emacs-dsh-tool-error-face
+  '((t :inherit error :weight bold))
+  "Face for a failed tool status." :group 'emacs-dsh)
+(defface emacs-dsh-tool-detail-face
+  '((t :inherit fixed-pitch :foreground "gray60"))
+  "Face for expanded tool details." :group 'emacs-dsh)
 (defcustom emacs-dsh-connection-mode 'auto
   "How Emacs connects to a local DSH Host.
 `auto' prefers the local Desktop bridge file when present, otherwise starts
@@ -100,6 +124,8 @@ and on macOS, nil sends paths unchanged."
 (defvar-local emacs-dsh--queue-items nil)
 (defvar-local emacs-dsh--queue-seq -1)
 (defvar-local emacs-dsh--queue-ready nil)
+(defvar-local emacs-dsh--tool-cards nil)
+(defvar-local emacs-dsh--tool-pending nil)
 (defconst emacs-dsh--composer-prefix "\nYou> ")
 
 (defun emacs-dsh--base ()
@@ -578,9 +604,14 @@ An existing but invalid bridge must fail validation, not silently fall back."
   (setq-local emacs-dsh--queue-items nil)
   (setq-local emacs-dsh--queue-seq -1)
   (setq-local emacs-dsh--queue-ready nil)
+  (setq-local emacs-dsh--tool-cards (make-hash-table :test #'equal))
+  (setq-local emacs-dsh--tool-pending nil)
   (setq-local emacs-dsh--cursor -1)
   (setq-local emacs-dsh--last-prompt nil)
   (setq-local truncate-lines nil)
+  (setq-local buffer-invisibility-spec (copy-tree buffer-invisibility-spec))
+  (add-to-invisibility-spec 'markdown-markup)
+  (add-to-invisibility-spec 'emacs-dsh-tool-details)
   (setq-local header-line-format '(:eval (emacs-dsh--header)))
   (tab-line-mode -1)
   (setq-local mode-line-format
@@ -590,9 +621,15 @@ An existing but invalid bridge must fail validation, not silently fall back."
 
 (defun emacs-dsh--header ()
   (when emacs-dsh--last-prompt
-    (replace-regexp-in-string "%" "%%"
-                              (concat "user> " (replace-regexp-in-string
-                                                "[\r\n]+" " ↵ " emacs-dsh--last-prompt)))))
+    (let* ((full (concat "user> " (replace-regexp-in-string
+                                   "[\r\n]+" " ↵ " emacs-dsh--last-prompt)))
+           (window (get-buffer-window (current-buffer) t))
+           (width (if window (window-body-width window) 100))
+           (shown (truncate-string-to-width full (max 30 (1- width))
+                                            nil nil "…")))
+      (propertize (replace-regexp-in-string "%" "%%" shown)
+                  'face 'emacs-dsh-user-face
+                  'help-echo full))))
 (defun emacs-dsh--state ()
   (let* ((selection emacs-dsh--model-selection)
          (queued (cl-count 'queued emacs-dsh--queue-items :key #'car))
@@ -667,7 +704,231 @@ An existing but invalid bridge must fail validation, not silently fall back."
                      emacs-dsh--input-start (point-max)))
       (insert (propertize (concat text "\n") 'read-only t
                           'rear-nonsticky '(read-only)
-                          'face (or face 'default))))))
+                           'face (or face 'default))))))
+
+(defun emacs-dsh--markdown-text (text)
+  "Return TEXT with Markdown faces and hidden markup as text properties.
+The original characters remain in the transcript for copying and search."
+  (condition-case nil
+      (with-temp-buffer
+        (insert text)
+        (delay-mode-hooks (markdown-mode))
+        (setq-local markdown-hide-markup t)
+        (setq-local markdown-hide-urls t)
+        (font-lock-flush)
+        (font-lock-ensure)
+        (let* ((source (buffer-substring (point-min) (point-max)))
+               (rendered (substring-no-properties source))
+               (index 0))
+          (while (< index (length source))
+            (let ((next (or (next-property-change index source) (length source)))
+                  (props nil))
+              (dolist (key '(face font-lock-face display invisible))
+                (when-let* ((value (get-text-property index key source)))
+                  (setq props (plist-put props key value))))
+              (when props (add-text-properties index next props rendered))
+              (setq index next)))
+          rendered))
+    (error text)))
+
+(defvar emacs-dsh--link-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'emacs-dsh-open-link)
+    (define-key map [mouse-1] #'emacs-dsh-open-link)
+    map)
+  "Keymap on Markdown links in a DSH transcript.")
+
+;;;###autoload
+(defun emacs-dsh-open-link (&optional event)
+  "Open the Markdown URL at point or mouse EVENT."
+  (interactive (list last-input-event))
+  (when (mouse-event-p event) (mouse-set-point event))
+  (let ((url (cl-loop for overlay in (overlays-at (point))
+                      thereis (overlay-get overlay 'emacs-dsh-url))))
+    (unless url (user-error "Move to a DSH Markdown link first"))
+    (browse-url url)))
+
+(defun emacs-dsh--linkify-markdown (text start)
+  "Make HTTP(S) Markdown links in TEXT interactive at buffer position START."
+  (let ((offset 0))
+    (while (string-match "\\[\\([^]]+\\)\\](\\(https?://[^)[:space:]]+\\))"
+                         text offset)
+      (let ((overlay (make-overlay (+ start (match-beginning 1))
+                                   (+ start (match-end 1)) nil t nil))
+            (url (match-string 2 text)))
+        (overlay-put overlay 'emacs-dsh-url url)
+        (overlay-put overlay 'keymap emacs-dsh--link-map)
+        (overlay-put overlay 'mouse-face 'highlight)
+        (overlay-put overlay 'help-echo (concat "Open " url)))
+      (setq offset (match-end 0)))))
+
+(defun emacs-dsh--insert-message (label text &optional user)
+  "Insert LABEL and TEXT as a readable transcript message.
+Assistant TEXT is rendered as Markdown; USER text is shown literally."
+  (let* ((body (if user text (emacs-dsh--markdown-text text)))
+         (prefix (propertize label 'face (if user 'emacs-dsh-user-face
+                                          'emacs-dsh-assistant-label-face)))
+         (formatted (concat prefix body "\n")))
+    (when user
+      (add-face-text-property 0 (length formatted) 'emacs-dsh-user-face
+                              'append formatted))
+    (let ((inhibit-read-only t)
+          (widget (emacs-dsh--input-widget)))
+      (save-excursion
+        (goto-char (if (and widget emacs-dsh--input-start)
+                       emacs-dsh--input-start (point-max)))
+        (let ((start (point)))
+          (insert formatted "\n")
+          (add-text-properties start (point) '(read-only t
+                                               rear-nonsticky (read-only)))
+          (unless user
+            (emacs-dsh--linkify-markdown text (+ start (length label)))))))))
+
+(cl-defstruct (emacs-dsh--tool-card
+               (:constructor emacs-dsh--tool-card-create))
+  id name summary header details end expanded status)
+
+(defvar emacs-dsh--tool-header-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'emacs-dsh-toggle-tool-details)
+    (define-key map [mouse-1] #'emacs-dsh-toggle-tool-details)
+    map)
+  "Keymap on a tool card header.")
+
+(defun emacs-dsh--tool-summary (arguments)
+  "Return a compact one-line summary of tool ARGUMENTS."
+  (let* ((parsed (and (stringp arguments)
+                      (condition-case nil
+                          (json-parse-string arguments :object-type 'alist
+                                             :array-type 'list)
+                        (error nil))))
+         (preferred (cl-loop for key in '(description command code path query url)
+                             for value = (alist-get key parsed)
+                             when (and (stringp value) (not (string-empty-p value)))
+                             return value))
+         (first (car (split-string (or preferred arguments "") "[\r\n]" t))))
+    (truncate-string-to-width
+     (string-trim (replace-regexp-in-string "[[:space:]]+" " " (or first "")))
+     88 nil nil t)))
+
+(defun emacs-dsh--tool-label (card)
+  "Return the visible header for CARD."
+  (let* ((status (emacs-dsh--tool-card-status card))
+         (face (pcase status
+                 ('success 'emacs-dsh-tool-success-face)
+                 ('error 'emacs-dsh-tool-error-face)
+                 (_ 'emacs-dsh-tool-face)))
+         (symbol (pcase status ('success "✓") ('error "✗") (_ "●")))
+         (summary (emacs-dsh--tool-card-summary card)))
+    (concat
+     (propertize (format "  %s %s "
+                         (if (emacs-dsh--tool-card-expanded card) "▾" "▸")
+                         symbol) 'face face)
+     (propertize (emacs-dsh--tool-card-name card) 'face 'emacs-dsh-tool-face)
+     (if (string-empty-p summary) ""
+       (propertize (concat " — " summary) 'face 'emacs-dsh-tool-face)))))
+
+(defun emacs-dsh--refresh-tool-card (card)
+  "Update CARD's header and detail visibility."
+  (overlay-put (emacs-dsh--tool-card-header card) 'display
+               (emacs-dsh--tool-label card))
+  (overlay-put (emacs-dsh--tool-card-details card) 'invisible
+               (unless (emacs-dsh--tool-card-expanded card)
+                 'emacs-dsh-tool-details)))
+
+;;;###autoload
+(defun emacs-dsh-toggle-tool-details (&optional event)
+  "Expand or collapse the tool card at point or mouse EVENT."
+  (interactive (list last-input-event))
+  (when (mouse-event-p event) (mouse-set-point event))
+  (let ((card (cl-loop for overlay in (overlays-at (point))
+                       thereis (overlay-get overlay 'emacs-dsh-tool-card))))
+    (unless card (user-error "Move to a DSH tool header first"))
+    (setf (emacs-dsh--tool-card-expanded card)
+          (not (emacs-dsh--tool-card-expanded card)))
+    (emacs-dsh--refresh-tool-card card)))
+
+(defun emacs-dsh--make-tool-card (id name arguments)
+  "Insert a collapsed tool card for ID, NAME and ARGUMENTS."
+  (let ((inhibit-read-only t)
+        (widget (emacs-dsh--input-widget))
+        card)
+    (save-excursion
+      (goto-char (if (and widget emacs-dsh--input-start)
+                     emacs-dsh--input-start (point-max)))
+      (let ((header-start (point)))
+        (insert "Tool\n")
+        (let* ((header (make-overlay header-start (1- (point)) nil t nil))
+               (details-start (point))
+               (detail-text (if (and (stringp arguments)
+                                     (not (string-empty-p arguments)))
+                                (concat "    Arguments:\n"
+                                        (replace-regexp-in-string
+                                         "^" "    " arguments) "\n")
+                              "    Arguments: none\n")))
+          (insert detail-text "\n")
+          (add-text-properties header-start (point)
+                               '(read-only t rear-nonsticky (read-only)))
+          (add-face-text-property details-start (point)
+                                  'emacs-dsh-tool-detail-face 'append)
+          (let ((details (make-overlay details-start (point) nil nil nil))
+                (end (copy-marker (point) nil)))
+            (setq card (emacs-dsh--tool-card-create
+                        :id id :name name :summary (emacs-dsh--tool-summary arguments)
+                        :header header :details details :end end
+                        :expanded nil :status 'running))
+            (overlay-put header 'emacs-dsh-tool-card card)
+            (overlay-put header 'keymap emacs-dsh--tool-header-map)
+            (overlay-put header 'mouse-face 'highlight)
+            (overlay-put header 'help-echo "RET or click: toggle tool details")
+            (emacs-dsh--refresh-tool-card card)))))
+    (puthash id card emacs-dsh--tool-cards)
+    card))
+
+(defun emacs-dsh--tool-call (data seq)
+  "Render tool call DATA at event SEQ."
+  (let* ((id (or (alist-get 'callId data) (format "event:%s" seq)))
+         (name (or (alist-get 'name data) "tool")))
+    (push id emacs-dsh--tool-pending)
+    (emacs-dsh--make-tool-card id name (alist-get 'arguments data))))
+
+(defun emacs-dsh--tool-result (data)
+  "Append tool result DATA to its matching card."
+  (let* ((message (alist-get 'message data))
+         (id (or (alist-get 'callId message)
+                 (alist-get 'callId (alist-get 'source message))
+                 (alist-get 'callId data)
+                 (car emacs-dsh--tool-pending)))
+         (card (and id (gethash id emacs-dsh--tool-cards)))
+         (blocks (alist-get 'content message))
+         (failed (or (alist-get 'error data)
+                     (cl-some (lambda (block) (alist-get 'isError block)) blocks)))
+         (text (emacs-dsh--content blocks))
+         (reason (alist-get 'reason (alist-get 'error data))))
+    (unless card
+      (setq id (or id (format "orphan:%s" (float-time)))
+            card (emacs-dsh--make-tool-card id "tool result" nil)))
+    (setq emacs-dsh--tool-pending (delete id emacs-dsh--tool-pending))
+    (let ((inhibit-read-only t)
+          (details (emacs-dsh--tool-card-details card)))
+      (save-excursion
+        (goto-char (marker-position (emacs-dsh--tool-card-end card)))
+        (let ((start (point)))
+          (insert (format "    %s:\n%s%s\n\n"
+                          (if failed "Error" "Result")
+                          (replace-regexp-in-string
+                           "^" "    " (if (string-empty-p text) "(empty)" text))
+                          (if (and (stringp reason) (not (string-empty-p reason))
+                                   (not (string-match-p (regexp-quote reason) text)))
+                              (concat "\n    Reason: " reason) "")))
+          (add-text-properties start (point)
+                               '(read-only t rear-nonsticky (read-only)))
+          (add-face-text-property start (point)
+                                  'emacs-dsh-tool-detail-face 'append)
+          (set-marker (emacs-dsh--tool-card-end card) (point))
+          (move-overlay details (overlay-start details) (point)))))
+    (setf (emacs-dsh--tool-card-status card) (if failed 'error 'success))
+    (emacs-dsh--refresh-tool-card card)))
 
 (defun emacs-dsh--content (blocks)
   (mapconcat
@@ -699,7 +960,7 @@ An existing but invalid bridge must fail validation, not silently fall back."
                          (or (not source)
                              (equal (alist-get 'kind source) "user"))))
               (setq emacs-dsh--last-prompt text)
-              (emacs-dsh--insert-before-input (concat "You: " text) 'font-lock-keyword-face))))
+               (emacs-dsh--insert-message "You: " text t))))
         ("assistant/message"
          (let* ((message (alist-get 'message data))
                 (text (emacs-dsh--content (alist-get 'content message))))
@@ -707,19 +968,11 @@ An existing but invalid bridge must fail validation, not silently fall back."
             (when emacs-dsh--stream-overlay
               (overlay-put emacs-dsh--stream-overlay 'before-string nil))
            (unless (string-empty-p text)
-             (emacs-dsh--insert-before-input (concat "DSH: " text) 'default))))
+              (emacs-dsh--insert-message "DSH: " text))))
         ("tool/call"
-         (emacs-dsh--insert-before-input
-          (format "[tool %s] %s" (or (alist-get 'name data) "?")
-                  (or (alist-get 'arguments data) "")) 'shadow))
+         (emacs-dsh--tool-call data seq))
         ("tool/result"
-         (let* ((message (alist-get 'message data))
-                (blocks (alist-get 'content message))
-                (text (emacs-dsh--content blocks))
-                (failed (or (alist-get 'error data)
-                            (cl-some (lambda (block) (alist-get 'isError block)) blocks))))
-           (emacs-dsh--insert-before-input
-           (format "[tool %s] %s" (if failed "error" "result") text) 'shadow)))
+         (emacs-dsh--tool-result data))
         ("model/selection"
          (setq emacs-dsh--model-selection data))
         ("request/header"
@@ -764,9 +1017,11 @@ An existing but invalid bridge must fail validation, not silently fall back."
                                                   emacs-dsh--input-start)))
   (when emacs-dsh--stream-overlay
     (overlay-put emacs-dsh--stream-overlay 'before-string
-                 (and emacs-dsh--stream-text
-                      (propertize (concat "DSH (streaming): " emacs-dsh--stream-text "\n")
-                                  'face 'shadow)))))
+                  (and emacs-dsh--stream-text
+                       (concat (propertize "DSH: " 'face
+                                           'emacs-dsh-assistant-label-face)
+                               (propertize emacs-dsh--stream-text 'face 'shadow)
+                               (propertize " ▍\n" 'face 'shadow))))))
 
 (defun emacs-dsh--queue-from-inbox (inbox)
   "Return user-visible (PLACEMENT . MESSAGE) pairs from INBOX."

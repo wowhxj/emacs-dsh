@@ -14,7 +14,7 @@
 
 ## 安装
 
-需要 Emacs 29.1+ 和可用的 DSH。`websocket.el` 已声明在 Emacs 包的 `Package-Requires` 中，通过包管理器安装时无需单独配置；源码直载时需自行确保它在 `load-path` 中。
+需要 Emacs 29.1+ 和可用的 DSH。`websocket.el` 与 `markdown-mode` 都已声明在 Emacs 包的 `Package-Requires` 中，通过包管理器安装时无需单独配置；源码直载时需自行确保它们在 `load-path` 中。
 
 通过 Emacs 包管理器安装本仓库后，示例配置为：
 
@@ -64,6 +64,8 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 
 最近一条用户 query 固定在聊天窗口顶部；mode-line 显示会话 ID、状态、队列数量（`Q` 为待发送、`S` 为 steer）、模型、思考程度和项目路径。新会话会自动读取 Host 默认模型。`/model` 可选择模型，`/reasoning` 可选择当前模型支持的思考程度。`/help` 显示客户端命令及 Host 提供的命令；其他 Host 命令由 `commands/list` 发现并交给 Host 执行。已注册的 `/skill-name` 作为 prompt 提交。
 
+助手回复使用 `markdown-mode` 的 Emacs 原生样式显示标题、强调、代码和链接，并隐藏部分 Markdown 标记；buffer 中仍保留原文，复制和搜索得到的是原始 Markdown。HTTP(S) 链接可用 `RET` 或鼠标点击打开。流式回复先以轻量文本显示，消息完成后再排版。工具调用显示为带状态和参数摘要的卡片：`●` 运行中、`✓` 成功、`✗` 失败；把光标移到卡片标题后按 `RET` 或点击，可展开/收起完整参数和结果。较长的结果默认收起，以免遮住对话。
+
 输入 `@` 后按 `TAB` 可从 Host 文件和其他会话中选择引用。跨会话引用直接插入 Host 返回的 `@[标题](dsh-session:…)` 文本；发送时无需另行打开源会话。`M-x emacs-dsh-insert-file` 可手动插入文件引用，`M-x emacs-dsh-attach-image` 可暂存图片。智能粘贴在 WSL 读取 Windows 剪贴板，在 macOS 读取本机剪贴板。
 
 `C-c C-l`（或 `/queue`）列出当前会话尚未被 Host 消费的消息。选择一条后可编辑纯文本、删除，或将待发送消息转为本轮 steer；后者仅在 Agent 运行时有效。队列内容来自 Host 的 `session/control` → `inbox` 实时投影，因此在其他客户端做的改动也会反映到 Emacs。网络断开重连后会重新读取队列快照。队列操作失败时原有项目保持不变，Host 错误会显示在 minibuffer。
@@ -82,11 +84,11 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 
 ## 开发验证
 
-把本仓库与已安装的 `websocket.el` 加入 `load-path` 后运行：
+把本仓库与已安装的 `websocket.el`、`markdown-mode` 加入 `load-path` 后运行：
 
 ```sh
-emacs -Q --batch -L /path/to/websocket-el -L . -f batch-byte-compile emacs-dsh.el
-emacs -Q --batch -L /path/to/websocket-el -L . -l emacs-dsh.el -l tests.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -L /path/to/websocket-el -L /path/to/markdown-mode -L . -f batch-byte-compile emacs-dsh.el
+emacs -Q --batch -L /path/to/websocket-el -L /path/to/markdown-mode -L . -l emacs-dsh.el -l tests.el -f ert-run-tests-batch-and-exit
 ```
 
 Windows/WSL 的 Emacs 回归测试可运行；macOS 的剪贴板与路径有单元测试，队列和引用逻辑不依赖 WSL 路径工具。真实 Desktop Host 端到端行为仍需在 Mac 上验证。Host bridge 有自己的测试和发布流程。
