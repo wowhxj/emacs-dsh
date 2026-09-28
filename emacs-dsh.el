@@ -8,9 +8,8 @@
 ;; URL: https://github.com/wowhxj/emacs-dsh
 
 ;;; Commentary:
-;; A client for DSH Web Host.  By default Emacs starts its own local Host and
-;; authenticates using its launch URL.  An optional bridge connects to the
-;; already running DSH Desktop Host.  See README.md for both modes.
+;; A client for DSH Web Host.  By default it prefers the local Desktop bridge
+;; when present, otherwise Emacs starts its own Host.  See README.md.
 
 ;;; Code:
 
@@ -32,11 +31,14 @@
      :background "#29434b" :foreground "#e5f2ef")
     (t :inherit mode-line))
   "Face for the DSH mode-line status." :group 'emacs-dsh)
-(defcustom emacs-dsh-connection-mode 'managed
+(defcustom emacs-dsh-connection-mode 'auto
   "How Emacs connects to a local DSH Host.
+`auto' prefers the local Desktop bridge file when present, otherwise starts
+and owns a `dsh web' process.  This is the default.
 `managed' starts and owns a `dsh web' process in Emacs's operating system.
 `desktop' uses the separately installed Host bridge to join DSH Desktop."
-  :type '(choice (const :tag "Emacs-managed dsh web" managed)
+  :type '(choice (const :tag "Prefer Desktop bridge, otherwise dsh web" auto)
+                 (const :tag "Emacs-managed dsh web" managed)
                  (const :tag "Existing Desktop Host via bridge" desktop))
   :group 'emacs-dsh)
 (defcustom emacs-dsh-managed-command "dsh"
@@ -383,9 +385,22 @@ buffer that initiated the call, if that buffer is still alive."
 
 (add-hook 'kill-emacs-hook #'emacs-dsh--managed-stop)
 
-(defun emacs-dsh--connection-launch (callback)
-  "Discover the selected local Host; pass (connection error) to CALLBACK."
+(defun emacs-dsh--effective-mode ()
+  "Return the Host mode selected by `emacs-dsh-connection-mode'.
+In `auto' mode the presence of the bridge file indicates a Desktop Host.
+An existing but invalid bridge must fail validation, not silently fall back."
   (pcase emacs-dsh-connection-mode
+    ('auto (if-let* ((file (emacs-dsh--bridge-path)))
+               (if (or (file-remote-p file)
+                       (file-exists-p file)
+                       (file-symlink-p file))
+                   'desktop 'managed)
+             'managed))
+    (mode mode)))
+
+(defun emacs-dsh--connection-launch (mode callback)
+  "Discover MODE's local Host; pass (connection error) to CALLBACK."
+  (pcase mode
     ('managed (emacs-dsh--managed-start callback))
     ('desktop
      (let ((result (condition-case err
@@ -438,15 +453,16 @@ buffer that initiated the call, if that buffer is still alive."
          (notify (lambda (failure)
                    (when (buffer-live-p origin)
                      (with-current-buffer origin (funcall callback failure)))))
-         (mode emacs-dsh-connection-mode))
+         (mode (emacs-dsh--effective-mode)))
     (push notify emacs-dsh--auth-waiters)
     (unless emacs-dsh--auth-running
       (setq emacs-dsh--auth-running t)
       (emacs-dsh--connection-launch
+       mode
        (lambda (connection failure)
          (cond
           (failure (emacs-dsh--auth-finish failure))
-          ((not (eq mode emacs-dsh-connection-mode))
+          ((not (eq mode (emacs-dsh--effective-mode)))
            (emacs-dsh--auth-finish "Connection mode changed; retry"))
           ((and emacs-dsh--cookie-jar
                 (equal (car connection) emacs-dsh--authenticated-base)
@@ -493,7 +509,7 @@ buffer that initiated the call, if that buffer is still alive."
 (defun emacs-dsh--host-path (path)
   (cond (emacs-dsh-wsl-path-function
          (funcall emacs-dsh-wsl-path-function path))
-        ((and (eq emacs-dsh-connection-mode 'desktop)
+        ((and (eq (emacs-dsh--effective-mode) 'desktop)
               (getenv "WSL_DISTRO_NAME"))
          (emacs-dsh-wsl-windows-path path))
         (t path)))

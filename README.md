@@ -2,14 +2,15 @@
 
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的 Emacs 客户端，交互方式参考 [pimacs.el](https://github.com/ananthakumaran/pimacs.el)。支持创建和恢复会话、流式回复、模型与思考程度切换、`/` 命令、技能、`@` 文件补全和图片附件。连接时无需输入用户名、密码或手动粘贴 token。
 
-## 两种连接方式
+## 连接方式
 
 | 模式 | 适用情况 | 安装要求 | Host 生命周期 |
 | --- | --- | --- | --- |
-| `managed`（默认） | Emacs 自己启动本机 Web Host | Emacs 所在系统中能运行 `dsh` CLI | 首次连接时启动 `dsh web`，退出 Emacs 时结束该进程 |
-| `desktop` | 复用正在运行的 DSH Desktop Host 及其 profile | 另行安装 [emacs-dsh-host-bridge](https://github.com/wowhxj/emacs-dsh-host-bridge) | 由 Desktop 管理；Emacs 不负责启动 |
+| `auto`（默认） | 检测到 bridge 文件时优先复用 Desktop，否则由 Emacs 启动 Web Host | 使用 Desktop 时安装 [emacs-dsh-host-bridge](https://github.com/wowhxj/emacs-dsh-host-bridge)；回退启动时需有 `dsh` CLI | 跟随实际选中的 Host |
+| `desktop` | 始终复用 DSH Desktop Host 及其 profile | 安装并启用独立 Host bridge | 由 Desktop 管理；Emacs 不负责启动 |
+| `managed` | 始终由 Emacs 启动本机 Web Host | Emacs 所在系统中能运行 `dsh` CLI | 首次连接时启动 `dsh web`，退出 Emacs 时结束该进程 |
 
-两种模式都只连接本机 `127.0.0.1`。托管模式用 `dsh web --host 127.0.0.1 --port 0 --no-open` 启动 Host，从启动输出取得一次性 URL，并换取 Host 签名 cookie。`--port 0` 由系统选择空闲端口。Desktop 模式通过 bridge 取得同类 URL；bridge 与 Emacs 包分别安装和更新。**两个模式使用不同的 Host/profile，会话、模型设置与技能配置不一定相同。**
+两种 Host 都只连接本机 `127.0.0.1`。自动模式以 bridge 文件作为 Desktop Host 可用的信号；文件存在但损坏或无效时会报告错误，不会悄悄启动另一个 Host。托管 Host 用 `dsh web --host 127.0.0.1 --port 0 --no-open` 启动，从输出取得一次性 URL，并换取 Host 签名 cookie。`--port 0` 由系统选择空闲端口。bridge 与 Emacs 包分别安装和更新。**两个 Host 使用不同的 profile，会话、模型设置与技能配置不一定相同。**
 
 ## 安装
 
@@ -26,9 +27,9 @@
 
 开发时也可添加 `:load-path "/absolute/path/to/emacs-dsh"`。源码直载时若有旧的 `emacs-dsh.elc`，请重新编译或删除该旧文件，以免 Emacs 加载旧实现。
 
-### 默认：Emacs 管理 Host
+### 没有 bridge 时：Emacs 管理 Host
 
-先在 **Emacs 所在的操作系统** 中确认 `dsh web --help` 可运行，并为该 DSH profile 配置模型。运行 `M-x emacs-dsh-chat` 即可；无需安装 Host bridge，也无需预先打开 DSH Desktop。若图形 Emacs 的 PATH 找不到 CLI，可指定绝对路径：
+先在 **Emacs 所在的操作系统** 中确认 `dsh web --help` 可运行，并为该 DSH profile 配置模型。没有 bridge 文件时运行 `M-x emacs-dsh-chat` 会自动启动本机 Host；无需预先打开 DSH Desktop。若图形 Emacs 的 PATH 找不到 CLI，可指定绝对路径：
 
 ```elisp
 (setq emacs-dsh-managed-command "/absolute/path/to/dsh")
@@ -38,7 +39,7 @@ WSL Emacs 会启动 **WSL 内的 Linux `dsh`**，并向该 Host 发送 Linux 路
 
 ### 可选：连接 DSH Desktop
 
-先在 DSH Desktop 的 **Plugins → Install** 安装 `github:wowhxj/emacs-dsh-host-bridge`，启用后按提示重启 App/Host。安装说明和故障排查见 [独立插件仓库](https://github.com/wowhxj/emacs-dsh-host-bridge)。然后在 Emacs 配置中选择：
+先在 DSH Desktop 的 **Plugins → Install** 安装 `github:wowhxj/emacs-dsh-host-bridge`，启用后按提示重启 App/Host。安装说明和故障排查见 [独立插件仓库](https://github.com/wowhxj/emacs-dsh-host-bridge)。默认 `auto` 模式会优先使用生成的 bridge 文件，无需额外配置。如果想强制只使用 Desktop，可设置：
 
 ```elisp
 (setq emacs-dsh-connection-mode 'desktop)
@@ -68,7 +69,7 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 
 ## 故障排查
 
-- **提示找不到 `dsh`**：当前是默认 `managed` 模式。请在 Emacs 所在系统安装/配置 CLI，或设置 `emacs-dsh-managed-command` 的绝对路径。若要复用 Desktop，安装独立 bridge 并改用 `desktop` 模式。
+- **提示找不到 `dsh`**：自动模式没有找到 bridge 文件，已尝试启动本机 Host。请在 Emacs 所在系统安装/配置 CLI，或设置 `emacs-dsh-managed-command` 的绝对路径；若希望复用 Desktop，确认独立 bridge 已启用并生成文件。
 - **托管 Host 启动超时或退出**：在 Emacs 所在系统手动运行 `dsh web --host 127.0.0.1 --port 0 --no-open` 检查 CLI/profile 的错误。不要分享输出中的 token URL。
 - **Desktop 模式找不到 bridge**：确认独立插件安装在 Desktop 使用的 profile、已启用且 Host 已重启。用 `ls -ld ~/.dsh ~/.dsh/emacs-dsh-bridge.json` 检查 macOS 文件是否存在和权限，不要输出文件内容。自定义路径可设 `emacs-dsh-bridge-file`。
 - **HTTP 401/403**：401 会重新换取 cookie；反复失败时检查 Host 是否重启或 bridge 是否属于当前 Host。403 检查 Host/Origin 配置。
