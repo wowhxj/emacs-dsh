@@ -1805,14 +1805,15 @@ MAX-MESSAGES limits history included in the first snapshot."
 
 ;;;###autoload
 (defun emacs-dsh-chat (&optional root choose-mode)
-  "Create a DSH Session in ROOT; with prefix CHOOSE-MODE select its preset."
+  "Create a DSH Session in ROOT using Standard by default.
+With prefix CHOOSE-MODE, select a preset before creation."
   (interactive (list (read-directory-name "DSH root: " (emacs-dsh--project-root) nil t)
                      current-prefix-arg))
   (setq root (file-name-as-directory (expand-file-name (or root (emacs-dsh--project-root)))))
   (if choose-mode
       (emacs-dsh--pick-preset
        (lambda (preset) (emacs-dsh--create-session root preset)))
-    (emacs-dsh--create-session root nil)))
+    (emacs-dsh--create-session root "standard")))
 
 (defun emacs-dsh--set-default-permission (session catalog root)
   "Set SESSION permission from CATALOG before displaying chat ROOT."

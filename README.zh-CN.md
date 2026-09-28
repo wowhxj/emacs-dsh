@@ -56,7 +56,7 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 
 | 操作 | 说明 |
 | --- | --- |
-| `M-x emacs-dsh-chat` 或 `<f7>` | 选择目录并创建新会话；`C-u M-x emacs-dsh-chat` 可在创建前选择模式 |
+| `M-x emacs-dsh-chat` 或 `<f7>` | 选择目录并创建新会话，默认使用 **Standard** 模式；`C-u M-x emacs-dsh-chat` 可在创建前选择其他模式 |
 | `C-c C-r` 或 `/resume` | 在 minibuffer 中搜索 Host 列出的所有工作区的会话（可用 Vertico/Orderless）；按时间、session ID、工作目录和首句交互对齐显示；恢复后关闭原聊天 buffer（未发送的输入会先确认） |
 | `i`（光标不在输入框时） | 跳到输入框已有文字末尾；在输入框内仍正常输入 `i` |
 | `M-p` / `M-n` | 上翻／下翻当前会话的用户 prompt 历史；下翻到末尾会恢复未发送的草稿 |

@@ -1430,6 +1430,17 @@
       (emacs-dsh-resume))
     (should (equal picked "two"))))
 
+(ert-deftest emacs-dsh-new-session-defaults-to-standard-mode ()
+  (let (created)
+    (cl-letf (((symbol-function 'emacs-dsh--create-session)
+               (lambda (_root preset) (setq created preset)))
+              ((symbol-function 'emacs-dsh--pick-preset)
+               (lambda (callback) (funcall callback "code"))))
+      (emacs-dsh-chat "/tmp" nil)
+      (should (equal created "standard"))
+      (emacs-dsh-chat "/tmp" t)
+      (should (equal created "code")))))
+
 (ert-deftest emacs-dsh-mode-choices-and-blank-selection ()
   (should (equal (emacs-dsh--preset-choices
                   '((presets . (((id . "code")) ((id . "minimal"))

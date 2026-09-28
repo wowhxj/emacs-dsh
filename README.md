@@ -56,7 +56,7 @@ When using Windows Desktop with WSL Emacs, choose a new-session directory that t
 
 | Action | Description |
 | --- | --- |
-| `M-x emacs-dsh-chat` or `<f7>` | Pick a directory and create a session; use `C-u M-x emacs-dsh-chat` to choose an agent mode before creation |
+| `M-x emacs-dsh-chat` or `<f7>` | Pick a directory and create a session in **Standard** mode by default; use `C-u M-x emacs-dsh-chat` to choose another agent mode before creation |
 | `C-c C-r` or `/resume` | Search sessions across all workspaces returned by the Host in the minibuffer (Vertico/Orderless supported); list entries show creation time, ID, directory, and first prompt. Resuming closes the old chat buffer, after confirmation if it has an unsent draft |
 | `i` (outside the composer) | Jump to the end of the draft; typing `i` inside the composer inserts text normally |
 | `M-p` / `M-n` | Navigate the current session's prompt history; moving forward past the newest prompt restores the unsent draft |
