@@ -1,6 +1,6 @@
 # emacs-dsh
 
-[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的 Emacs 客户端，交互方式参考 [pimacs.el](https://github.com/ananthakumaran/pimacs.el)。支持创建和恢复会话、流式回复、模型与思考程度切换、`/` 命令、技能、`@` 文件补全和图片附件。连接时无需输入用户名、密码或手动粘贴 token。
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的 Emacs 客户端，交互方式参考 [pimacs.el](https://github.com/ananthakumaran/pimacs.el)。支持创建和恢复会话、流式回复、模型与思考程度切换、`/` 命令、技能、队列管理、`@` 文件和跨会话引用补全，以及图片附件。连接时无需输入用户名、密码或手动粘贴 token。
 
 ## 连接方式
 
@@ -57,13 +57,16 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 | `C-c C-r` 或 `/resume` | 恢复会话；列表按创建时间、session ID、首句交互三列对齐 |
 | `RET` 或 `C-c C-c` | 发送输入 |
 | `C-c C-s` / `C-c C-k` | 运行中 steer / 取消轮次 |
+| `C-c C-l` 或 `/queue` | 查看待发送与 steer 消息，并可编辑、删除或把排队消息转为 steer |
 | `C-c C-q` | 关闭 Emacs 聊天 buffer，不删除 Host 会话 |
-| `TAB` | 补全 `/` 命令、技能或 `@` 文件引用 |
+| `TAB` | 补全 `/` 命令、技能或 `@` 文件及跨会话引用 |
 | `C-c C-p`、`s-v` 或 `s-V` | 智能粘贴文本、文件引用或图片 |
 
-最近一条用户 query 固定在聊天窗口顶部；mode-line 显示会话 ID、状态、模型、思考程度和项目路径。新会话会自动读取 Host 默认模型。`/model` 可选择模型，`/reasoning` 可选择当前模型支持的思考程度。`/help` 显示客户端命令及 Host 提供的命令；其他 Host 命令由 `commands/list` 发现并交给 Host 执行。已注册的 `/skill-name` 作为 prompt 提交。
+最近一条用户 query 固定在聊天窗口顶部；mode-line 显示会话 ID、状态、队列数量（`Q` 为待发送、`S` 为 steer）、模型、思考程度和项目路径。新会话会自动读取 Host 默认模型。`/model` 可选择模型，`/reasoning` 可选择当前模型支持的思考程度。`/help` 显示客户端命令及 Host 提供的命令；其他 Host 命令由 `commands/list` 发现并交给 Host 执行。已注册的 `/skill-name` 作为 prompt 提交。
 
-输入 `@` 后按 `TAB` 补全 Host 文件引用。`M-x emacs-dsh-insert-file` 可手动插入引用，`M-x emacs-dsh-attach-image` 可暂存图片。智能粘贴在 WSL 读取 Windows 剪贴板，在 macOS 读取本机剪贴板。
+输入 `@` 后按 `TAB` 可从 Host 文件和其他会话中选择引用。跨会话引用直接插入 Host 返回的 `@[标题](dsh-session:…)` 文本；发送时无需另行打开源会话。`M-x emacs-dsh-insert-file` 可手动插入文件引用，`M-x emacs-dsh-attach-image` 可暂存图片。智能粘贴在 WSL 读取 Windows 剪贴板，在 macOS 读取本机剪贴板。
+
+`C-c C-l`（或 `/queue`）列出当前会话尚未被 Host 消费的消息。选择一条后可编辑纯文本、删除，或将待发送消息转为本轮 steer；后者仅在 Agent 运行时有效。队列内容来自 Host 的 `session/control` → `inbox` 实时投影，因此在其他客户端做的改动也会反映到 Emacs。网络断开重连后会重新读取队列快照。队列操作失败时原有项目保持不变，Host 错误会显示在 minibuffer。
 
 历史由 Host 保存。客户端初次加载最近 `emacs-dsh-max-messages` 条消息，随后通过 WebSocket 接收实时事件并支持重连。旧历史分页、历史图片预览、人工审批及交互式问答控件尚未实现；需要审批或回答的轮次请在 DSH Desktop/Web 中处理。
 
@@ -86,6 +89,6 @@ emacs -Q --batch -L /path/to/websocket-el -L . -f batch-byte-compile emacs-dsh.e
 emacs -Q --batch -L /path/to/websocket-el -L . -l emacs-dsh.el -l tests.el -f ert-run-tests-batch-and-exit
 ```
 
-Windows/WSL 的 Emacs 回归测试可运行；macOS 的剪贴板与路径有单元测试，真实 Desktop Host 端到端行为仍需在 Mac 上验证。Host bridge 有自己的测试和发布流程。
+Windows/WSL 的 Emacs 回归测试可运行；macOS 的剪贴板与路径有单元测试，队列和引用逻辑不依赖 WSL 路径工具。真实 Desktop Host 端到端行为仍需在 Mac 上验证。Host bridge 有自己的测试和发布流程。
 
 协议参考：[Session Controller](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/api/session-controller)、[Connection](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/client/connection)、[API Gateway](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/api/gateway)。

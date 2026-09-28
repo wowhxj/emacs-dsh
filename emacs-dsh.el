@@ -97,6 +97,9 @@ and on macOS, nil sends paths unchanged."
 (defvar-local emacs-dsh--closing nil)
 (defvar-local emacs-dsh--command-inflight nil)
 (defvar-local emacs-dsh--model-selection nil)
+(defvar-local emacs-dsh--queue-items nil)
+(defvar-local emacs-dsh--queue-seq -1)
+(defvar-local emacs-dsh--queue-ready nil)
 (defconst emacs-dsh--composer-prefix "\nYou> ")
 
 (defun emacs-dsh--base ()
@@ -536,7 +539,8 @@ An existing but invalid bridge must fail validation, not silently fall back."
     (define-key map (kbd "C-c C-s") #'emacs-dsh-steer)
     (define-key map (kbd "C-c C-k") #'emacs-dsh-cancel)
     (define-key map (kbd "C-c C-q") #'emacs-dsh-quit)
-    (define-key map (kbd "C-c C-r") #'emacs-dsh-resume)
+     (define-key map (kbd "C-c C-r") #'emacs-dsh-resume)
+     (define-key map (kbd "C-c C-l") #'emacs-dsh-queue)
     (define-key map (kbd "C-c C-p") #'emacs-dsh-paste)
     (define-key map (kbd "TAB") #'emacs-dsh-complete)
     (define-key map (kbd "M-TAB") #'emacs-dsh-complete)
@@ -553,7 +557,8 @@ An existing but invalid bridge must fail validation, not silently fall back."
     (define-key map (kbd "C-c C-s") #'emacs-dsh-steer)
     (define-key map (kbd "C-c C-k") #'emacs-dsh-cancel)
     (define-key map (kbd "C-c C-q") #'emacs-dsh-quit)
-    (define-key map (kbd "C-c C-r") #'emacs-dsh-resume)
+     (define-key map (kbd "C-c C-r") #'emacs-dsh-resume)
+     (define-key map (kbd "C-c C-l") #'emacs-dsh-queue)
     (define-key map (kbd "C-c C-p") #'emacs-dsh-paste)
     (define-key map (kbd "TAB") #'emacs-dsh-complete)
     (define-key map (kbd "M-TAB") #'emacs-dsh-complete)
@@ -570,6 +575,9 @@ An existing but invalid bridge must fail validation, not silently fall back."
   (setq-local emacs-dsh--closing nil)
   (setq-local emacs-dsh--command-inflight nil)
   (setq-local emacs-dsh--model-selection nil)
+  (setq-local emacs-dsh--queue-items nil)
+  (setq-local emacs-dsh--queue-seq -1)
+  (setq-local emacs-dsh--queue-ready nil)
   (setq-local emacs-dsh--cursor -1)
   (setq-local emacs-dsh--last-prompt nil)
   (setq-local truncate-lines nil)
@@ -587,11 +595,15 @@ An existing but invalid bridge must fail validation, not silently fall back."
                                                 "[\r\n]+" " ↵ " emacs-dsh--last-prompt)))))
 (defun emacs-dsh--state ()
   (let* ((selection emacs-dsh--model-selection)
+         (queued (cl-count 'queued emacs-dsh--queue-items :key #'car))
+         (steering (cl-count 'steering emacs-dsh--queue-items :key #'car))
          (label (format " DSH [%s] %s%s%s  %s "
                         (or emacs-dsh--session-id "connecting")
                         (if emacs-dsh--running "running" "idle")
-                        (if emacs-dsh--attachments
-                            (format "  [%d image(s)]" (length emacs-dsh--attachments)) "")
+                         (concat (if emacs-dsh--attachments
+                                     (format "  [%d image(s)]" (length emacs-dsh--attachments)) "")
+                                 (if (or (> queued 0) (> steering 0))
+                                     (format "  [Q%d S%d]" queued steering) ""))
                         (if selection
                             (format "  %s/%s  thinking: %s"
                                     (alist-get 'provider selection)
@@ -756,6 +768,47 @@ An existing but invalid bridge must fail validation, not silently fall back."
                       (propertize (concat "DSH (streaming): " emacs-dsh--stream-text "\n")
                                   'face 'shadow)))))
 
+(defun emacs-dsh--queue-from-inbox (inbox)
+  "Return user-visible (PLACEMENT . MESSAGE) pairs from INBOX."
+  (append
+   (cl-loop for item in (alist-get 'next-turn inbox)
+            when (stringp (alist-get 'id item)) collect (cons 'queued item))
+   (cl-loop for item in (alist-get 'next-step inbox)
+            when (and (stringp (alist-get 'id item))
+                      (equal (alist-get 'kind (alist-get 'source item)) "user"))
+            collect (cons 'steering item))))
+
+(defun emacs-dsh--set-inbox (inbox seq)
+  "Apply an authoritative INBOX projection at SEQ."
+  (when (or (not (numberp seq)) (>= seq emacs-dsh--queue-seq))
+    (setq emacs-dsh--queue-items (emacs-dsh--queue-from-inbox inbox)
+          emacs-dsh--queue-seq (if (numberp seq) seq emacs-dsh--queue-seq)
+          emacs-dsh--queue-ready t)
+    (force-mode-line-update)))
+
+(defun emacs-dsh--control-item (value)
+  "Handle a session/control baseline or projection VALUE."
+  (pcase (alist-get 'type value)
+    ("baseline"
+     (let* ((projections (alist-get 'projections (alist-get 'value value)))
+            (entry (cl-loop for (id . cell) in projections
+                            when (equal (if (symbolp id) (symbol-name id) id)
+                                        emacs-dsh--session-id)
+                            return cell)))
+       (emacs-dsh--set-inbox (alist-get 'inbox (alist-get 'values entry))
+                             (or (alist-get 'asOfSeq entry) -1))))
+    ("projection"
+     (when (and (equal (alist-get 'sessionId value) emacs-dsh--session-id)
+                (equal (alist-get 'key value) "inbox"))
+       (emacs-dsh--set-inbox (alist-get 'value value)
+                             (alist-get 'seq value))))))
+
+(defun emacs-dsh--control-payload ()
+  "Return a session/control subscription frame."
+  (json-serialize `((type . "open") (streamId . ,(concat "control:" emacs-dsh--session-id))
+                    (endpoint . "session/control")
+                    (payload . ((args . ,(make-hash-table)))))))
+
 (defun emacs-dsh--on-frame (buffer socket frame)
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
@@ -764,7 +817,14 @@ An existing but invalid bridge must fail validation, not silently fall back."
             (let ((data (json-parse-string (websocket-frame-payload frame)
                                            :object-type 'alist :array-type 'list
                                            :null-object nil :false-object nil)))
-              (when (equal (alist-get 'streamId data) emacs-dsh--session-id)
+               (cond
+                ((equal (alist-get 'streamId data)
+                        (concat "control:" emacs-dsh--session-id))
+                 (pcase (alist-get 'type data)
+                   ("item" (emacs-dsh--control-item (alist-get 'value data)))
+                   ("error" (message "emacs-dsh control: %s"
+                                     (alist-get 'message (alist-get 'error data))))))
+                ((equal (alist-get 'streamId data) emacs-dsh--session-id)
                 (pcase (alist-get 'type data)
                   ("item"
                    (let ((value (alist-get 'value data)))
@@ -788,8 +848,8 @@ An existing but invalid bridge must fail validation, not silently fall back."
                                                      (or (alist-get 'cursor value) -1))))
                        ("event" (emacs-dsh--event (alist-get 'event value)))
                        ("assistant-stream" (emacs-dsh--stream (alist-get 'frame value))))))
-                  ("error" (message "emacs-dsh stream: %s"
-                                     (alist-get 'message (alist-get 'error data)))))))
+                   ("error" (message "emacs-dsh stream: %s"
+                                      (alist-get 'message (alist-get 'error data))))))))
           (error (message "emacs-dsh frame: %s" (error-message-string err))))))))
 
 (defun emacs-dsh--follow-payload (&optional session-id max-messages)
@@ -815,9 +875,10 @@ MAX-MESSAGES limits history included in the first snapshot."
     (when emacs-dsh--retry-timer
       (cancel-timer emacs-dsh--retry-timer)
       (setq emacs-dsh--retry-timer nil))
-    (let ((old emacs-dsh--socket))
+     (let ((old emacs-dsh--socket))
       (setq emacs-dsh--socket nil)
-      (when old (websocket-close old)))
+       (when old (websocket-close old)))
+     (setq emacs-dsh--queue-seq -1 emacs-dsh--queue-ready nil)
     (let* ((buffer (current-buffer))
            (base (emacs-dsh--base))
            (scheme (if (string-prefix-p "https:" base) "wss" "ws"))
@@ -836,7 +897,8 @@ MAX-MESSAGES limits history included in the first snapshot."
                    (when (buffer-live-p buffer)
                      (with-current-buffer buffer
                        (when (eq ws emacs-dsh--socket)
-                         (websocket-send-text ws (emacs-dsh--follow-payload))))))
+                          (websocket-send-text ws (emacs-dsh--follow-payload))
+                          (websocket-send-text ws (emacs-dsh--control-payload))))))
                  :on-message
                  (lambda (ws frame) (emacs-dsh--on-frame buffer ws frame))
                  :on-error
@@ -1364,7 +1426,7 @@ actual creation time.  Read all missing snapshots over one temporary socket."
      (when (equal draft (emacs-dsh--draft-text))
        (emacs-dsh--replace-draft ""))
      (emacs-dsh--insert-before-input
-      (concat "Commands: /model, /reasoning, /new, /resume, /file, /status, /help; Host: "
+      (concat "Commands: /model, /reasoning, /new, /resume, /queue, /file, /status, /help; Host: "
               (mapconcat (lambda (command)
                            (concat "/" (alist-get 'name command)))
                          commands ", ")
@@ -1397,9 +1459,13 @@ actual creation time.  Read all missing snapshots over one temporary socket."
       (emacs-dsh--replace-draft "")
       (emacs-dsh-chat emacs-dsh--root))
      ((equal name "resume")
+       (setq emacs-dsh--command-inflight nil)
+       (emacs-dsh--replace-draft "")
+       (emacs-dsh-resume))
+     ((equal name "queue")
       (setq emacs-dsh--command-inflight nil)
       (emacs-dsh--replace-draft "")
-      (emacs-dsh-resume))
+      (emacs-dsh-queue))
      ((equal name "file")
       (setq emacs-dsh--command-inflight nil)
       (emacs-dsh--replace-draft "")
@@ -1431,6 +1497,68 @@ actual creation time.  Read all missing snapshots over one temporary socket."
   (unless emacs-dsh--session-id (user-error "Not in a DSH chat"))
   (emacs-dsh--call "session/cancel" `((request . ((sessionId . ,emacs-dsh--session-id))))
                    (lambda (_) (message "emacs-dsh: cancelled"))))
+
+(defun emacs-dsh--queue-text (item)
+  "Return a short display string for queue ITEM."
+  (let ((content (alist-get 'content item)))
+    (string-trim
+     (replace-regexp-in-string
+      "[[:space:]\n\r]+" " "
+      (or (emacs-dsh--content content) "[attachment]")))))
+
+(defun emacs-dsh--queue-update (item kind &optional text)
+  "Apply KIND to ITEM, using TEXT for an edit."
+  (let ((action (append `((kind . ,kind))
+                        (when (equal kind "edit")
+                          `((content . [((type . "text") (text . ,text))]))))))
+    (emacs-dsh--call
+     "session/updateQueue"
+     `((request . ((sessionId . ,emacs-dsh--session-id)
+                   (itemId . ,(alist-get 'id item)) (action . ,action))))
+     (lambda (_) (message "emacs-dsh: queue %s accepted" kind))
+     (lambda (failure) (message "emacs-dsh: queue %s failed: %s" kind failure)))))
+
+;;;###autoload
+(defun emacs-dsh-queue ()
+  "Review, edit, remove, or steer pending messages in this DSH session."
+  (interactive)
+  (unless emacs-dsh--session-id (user-error "Not in a DSH chat"))
+  (unless emacs-dsh--queue-ready (user-error "DSH queue is still loading"))
+  (unless emacs-dsh--queue-items (user-error "No pending DSH messages"))
+  (let* ((choices
+          (cl-loop for (placement . item) in emacs-dsh--queue-items
+                   collect (cons (format "%s  %s  [%s]"
+                                         (if (eq placement 'queued) "Queued  " "Steering")
+                                         (truncate-string-to-width
+                                          (emacs-dsh--queue-text item) 72 nil nil t)
+                                         (alist-get 'id item))
+                                 (cons placement item))))
+         (picked (cdr (assoc (completing-read "DSH queue: " choices nil t)
+                             choices))))
+    (when picked
+      (let* ((placement (car picked))
+             (item (cdr picked))
+             (kind (cdr (assoc (completing-read
+                                "Queue action: "
+                                (append '(("Edit" . "edit") ("Remove" . "remove"))
+                                        (when (eq placement 'queued)
+                                          '(("Steer into current turn" . "steer"))))
+                                nil t)
+                               '(("Edit" . "edit") ("Remove" . "remove")
+                                 ("Steer into current turn" . "steer"))))))
+        (when kind
+          (if (equal kind "edit")
+              (let* ((content (alist-get 'content item))
+                     (text-only (cl-every (lambda (part)
+                                            (equal (alist-get 'type part) "text"))
+                                          content)))
+                (unless text-only (user-error "Only text-only queue items can be edited"))
+                (let ((new (read-string "Edit queued message: "
+                                        (emacs-dsh--content content))))
+                  (when (string-empty-p (string-trim new))
+                    (user-error "Queue message cannot be empty"))
+                  (emacs-dsh--queue-update item kind new)))
+            (emacs-dsh--queue-update item kind)))))))
 
 (defun emacs-dsh--close ()
   (setq emacs-dsh--closing t)
@@ -1489,40 +1617,65 @@ actual creation time.  Read all missing snapshots over one temporary socket."
       (concat "@" path))))
 
 (defun emacs-dsh--complete-host-file (context)
-  "Complete the @ mention in CONTEXT through the DSH Host."
+  "Complete an @ mention from Host files and cross-session references."
+  (let ((query (plist-get context :query)))
+    (emacs-dsh--call
+     "fileReferences/list"
+     `((agentId . ,emacs-dsh--session-id) (query . ,query))
+     (lambda (files)
+       (emacs-dsh--complete-references context files))
+     (lambda (failure)
+       (message "emacs-dsh: file candidates unavailable: %s" failure)
+       (emacs-dsh--complete-references context nil)))))
+
+(defun emacs-dsh--complete-references (context files)
+  "Finish @ completion with FILES and Host session candidates."
   (emacs-dsh--call
-   "fileReferences/list"
+   "sessionReferenceResolver/candidates"
    `((agentId . ,emacs-dsh--session-id)
      (query . ,(plist-get context :query)))
-   (lambda (candidates)
-     (let ((choices (delq nil
-                          (mapcar (lambda (item)
-                                    (let ((path (alist-get 'path item)))
-                                      (when (and (stringp path)
-                                                 (emacs-dsh--file-mention path))
-                                        (cons (format "%s  [%s]" path
-                                                      (or (alist-get 'kind item) "file"))
-                                              path))))
-                                  candidates))))
-       (cond
-        ((null choices) (message "emacs-dsh: no matching Host files"))
-        ((= (length choices) 1)
-         (emacs-dsh--replace-completion
-          context (emacs-dsh--file-mention (cdar choices))))
-        (t
-         (emacs-dsh--defer-picker
-          (lambda ()
-            (when-let* ((path (cdr (assoc
-                                     (completing-read "DSH @file: " choices nil t)
-                                     choices))))
-              (emacs-dsh--replace-completion
-               context (emacs-dsh--file-mention path)))))))))
+   (lambda (sessions)
+     (emacs-dsh--show-reference-choices context files sessions))
    (lambda (failure)
-     (message "emacs-dsh: Host file completion failed: %s" failure))))
+     (message "emacs-dsh: session candidates unavailable: %s" failure)
+     (emacs-dsh--show-reference-choices context files nil))))
+
+(defun emacs-dsh--show-reference-choices (context files sessions)
+  "Offer FILES and SESSIONS, inserting the Host's canonical mention."
+  (let ((choices
+         (append
+          (cl-loop for item in files
+                   for path = (alist-get 'path item)
+                   for mention = (and (stringp path) (emacs-dsh--file-mention path))
+                   when mention
+                   collect (cons (format "File: %s  [%s]" path
+                                         (or (alist-get 'kind item) "file")) mention))
+          (cl-loop for item in sessions
+                   for mention = (alist-get 'mention item)
+                   when (and (stringp mention)
+                             (string-prefix-p "@[" mention)
+                             (string-match-p "(dsh-session:" mention))
+                   collect (cons (format "Session: %s  [%s]"
+                                         (or (alist-get 'displayTitle item)
+                                             (alist-get 'label item) "untitled")
+                                         (or (alist-get 'sessionId item) "?"))
+                                 mention)))))
+    (cond
+     ((null choices) (message "emacs-dsh: no matching @ references"))
+     ((= (length choices) 1)
+      (emacs-dsh--replace-completion context (cdar choices)))
+     (t (emacs-dsh--defer-picker
+         (lambda ()
+           (when-let* ((mention (cdr (assoc
+                                      (completing-read "DSH @ reference: "
+                                                       choices nil t)
+                                      choices))))
+             (emacs-dsh--replace-completion context mention))))))))
 
 (defconst emacs-dsh--local-commands
   '(("model" . "Select model") ("reasoning" . "Select thinking effort")
-    ("new" . "Start a new session") ("resume" . "Resume a session")
+     ("new" . "Start a new session") ("resume" . "Resume a session")
+     ("queue" . "Manage queued messages")
     ("file" . "Insert a file reference") ("status" . "Show session status")
     ("help" . "List commands"))
   "Commands implemented by the Emacs client rather than the Host registry.")
