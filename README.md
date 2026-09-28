@@ -12,7 +12,7 @@ emacs-dsh 是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness
 
 ## 安装
 
-1. 在**正在使用的 DSH Host profile** 中，通过 DSH Plugins 界面安装本仓库的 `host-bridge` 目录并启用它，然后重启 Host。使用 Desktop profile 的 CLI 示例：`dsh plugin --profile desktop add ./host-bridge`。若使用 `dsh web`，请把 bridge 安装在对应的 Web profile。
+1. 在**正在使用的 DSH Host profile** 中安装本仓库的 `host-bridge` 目录并启用，然后重启 Host。官方 DSH Desktop 的 `desktop` profile 由应用管理：请在 Desktop 的 **Plugins** 页安装本地 `host-bridge` 目录，不要用独立 CLI 修改这个 profile。若运行独立的 `dsh web`，可在其 Web profile 中执行 `dsh plugin --profile web add file:/absolute/path/to/emacs-dsh/host-bridge`。只安装 Emacs 包不会自动安装 Host bridge。
 2. 确认 bridge 文件已生成：Windows 为 `%USERPROFILE%/.dsh/emacs-dsh-bridge.json`；macOS 默认为 `~/.dsh/emacs-dsh-bridge.json`。如果 Host 设置了 `DSH_HOME`，文件位于该目录下。**不要把 bridge 文件提交到 Git。**
 3. 安装 Emacs 客户端。使用包管理器安装本仓库后，可加入以下配置；`<f7>` 是示例快捷键，可按需修改：
 
@@ -59,7 +59,7 @@ macOS 的代码路径已有回归测试，但目前尚未在真实 macOS Host �
 
 bridge 使用 Host 自身的 `connection.authenticatedUrl()`，不新增未鉴权 HTTP 接口。Windows 的 bridge 文件保存 DPAPI 密文；macOS 的 bridge 文件保存明文启动 URL，因此其目录和文件权限很重要。Emacs 会用该 URL 换取签名 cookie，cookie 失效时自动重新鉴权。`M-x emacs-dsh-connect` 可用于主动检查连接，日常聊天无需先运行它。
 
-- **找不到 bridge**：确认它安装在当前 Host profile、已启用，且 Host 已重启。仅在 Plugins 界面看到 active 状态不足以证明文件已生成。
+- **找不到 bridge**：错误会给出 Emacs 实际查找的路径。确认 bridge 安装在当前 Host profile、已启用，且 Host 已重启；只安装 Emacs 包不够。macOS 可用 `ls -ld ~/.dsh ~/.dsh/emacs-dsh-bridge.json` 检查文件是否存在和目录权限，但不要输出 bridge 文件内容，其中含有启动令牌。若 Host 使用了自定义 `DSH_HOME`，让 Emacs 使用同一变量，或把文件路径设置为 `emacs-dsh-bridge-file`。仅在 Plugins 界面看到 active 状态不足以证明文件已生成。
 - **Host 关闭后无法连接**：保持 DSH Web Host 运行；若改用 `dsh web --no-open`，需要在其 profile 中启用 bridge。
 - **HTTP 401/403**：401 会自动尝试换新 cookie；反复失败时检查 bridge 是否属于当前 Host。403 请检查 Host/Origin 配置。
 - **路径或 `@` 引用不可用**：确认 Host 能访问所选项目目录。Windows Host 无法直接读取 WSL 专属的 Linux 路径。

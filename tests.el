@@ -191,6 +191,18 @@
           (should-error (emacs-dsh--bridge-launch)))
       (delete-file file))))
 
+(ert-deftest emacs-dsh-missing-bridge-reports-path ()
+  (let ((emacs-dsh-bridge-file (make-temp-name
+                                (expand-file-name "emacs-dsh-missing-" temporary-file-directory))))
+    (condition-case err
+        (progn (emacs-dsh--bridge-launch)
+               (ert-fail "Missing bridge should report an error"))
+      (error
+       (should (string-match-p "DSH bridge missing at"
+                               (error-message-string err)))
+       (should (string-match-p (regexp-quote emacs-dsh-bridge-file)
+                               (error-message-string err)))))))
+
 (ert-deftest emacs-dsh-posix-bridge-and-paths ()
   (let ((file (make-temp-file "emacs-dsh-posix-bridge-"))
         (emacs-dsh-wsl-path-function nil)
