@@ -109,6 +109,7 @@ and on macOS, nil sends paths unchanged."
 (defvar-local emacs-dsh--attachment-overlay nil)
 (defvar-local emacs-dsh--draft nil)
 (defvar-local emacs-dsh--input-start nil)
+(defvar-local emacs-dsh--input-background nil)
 (defvar-local emacs-dsh--stream-overlay nil)
 (defvar-local emacs-dsh--last-prompt nil)
 (defvar-local emacs-dsh--running nil)
@@ -590,6 +591,8 @@ An existing but invalid bridge must fail validation, not silently fall back."
 (defvar emacs-dsh--input-keymap
   (let ((map (copy-keymap widget-field-keymap)))
     (define-key map (kbd "RET") #'emacs-dsh-send)
+    (define-key map (kbd "S-<return>") #'newline)
+    (define-key map (kbd "S-RET") #'newline)
     (define-key map (kbd "C-c C-c") #'emacs-dsh-send)
     (define-key map (kbd "C-c C-s") #'emacs-dsh-steer)
     (define-key map (kbd "C-c C-k") #'emacs-dsh-cancel)
@@ -700,10 +703,15 @@ An existing but invalid bridge must fail validation, not silently fall back."
       (let ((draft emacs-dsh--draft))
         (setq emacs-dsh--draft nil)
         (setq-local emacs-dsh--draft
-                     (widget-create 'editable-field :size 64 :format "%v"
+                     (widget-create 'editable-field :format "%v"
                                     :keymap emacs-dsh--input-keymap
                                     :value (or draft ""))))
        (widget-setup)
+       (setq-local emacs-dsh--input-background
+                   (make-overlay (1+ (marker-position emacs-dsh--input-start))
+                                 (point-max) nil t t))
+       (overlay-put emacs-dsh--input-background 'face
+                    '(:inherit widget-field :extend t))
        (set-marker-insertion-type emacs-dsh--input-start t)
        (goto-char start)
        (when emacs-dsh--attachments
@@ -812,10 +820,34 @@ The original characters remain in the transcript for copying and search."
         (overlay-put overlay 'help-echo (concat "Open " url)))
       (setq offset (match-end 0)))))
 
-(defun emacs-dsh--insert-message (label text &optional user)
+(defun emacs-dsh--image-block (block)
+  "Render a user image BLOCK, falling back to its label without pixels."
+  (let* ((mime (alist-get 'mediaType block))
+         (type (cdr (assoc mime '(("image/png" . png) ("image/jpeg" . jpeg)
+                                  ("image/webp" . webp) ("image/gif" . gif)))))
+         (data (alist-get 'data block))
+         (image (and (display-images-p) type (stringp data)
+                     (ignore-errors
+                       (create-image (base64-decode-string data) type t
+                                     :max-width 480 :max-height 320)))))
+    (if image (propertize "[image]" 'display image) "[image]")))
+
+(defun emacs-dsh--insert-message (label text &optional user content)
   "Insert LABEL and TEXT as a readable transcript message.
-Assistant TEXT is rendered as Markdown; USER text is shown literally."
-  (let* ((body (if user text (emacs-dsh--markdown-text text)))
+Assistant TEXT is rendered as Markdown; USER CONTENT may contain images."
+  (let* ((body (if user
+                   (if content
+                       (mapconcat (lambda (block)
+                                    (if (equal (alist-get 'type block) "image")
+                                        (emacs-dsh--image-block block)
+                                      (pcase (alist-get 'type block)
+                                        ((or "text" "reasoning")
+                                         (or (alist-get 'text block) ""))
+                                        ("file" "[file]") (_ ""))))
+                                  (if (vectorp content) (append content nil) content)
+                                  "\n")
+                     text)
+                 (emacs-dsh--markdown-text text)))
          (prefix (propertize label 'face (if user 'emacs-dsh-user-face
                                           'emacs-dsh-assistant-label-face)))
          (formatted (concat prefix body "\n")))
@@ -1016,7 +1048,8 @@ Assistant TEXT is rendered as Markdown; USER text is shown literally."
                          (or (not source)
                              (equal (alist-get 'kind source) "user"))))
               (setq emacs-dsh--last-prompt text)
-               (emacs-dsh--insert-message "You: " text t))))
+               (emacs-dsh--insert-message "You: " text t
+                                          (alist-get 'content message)))))
         ("assistant/message"
          (let* ((message (alist-get 'message data))
                 (text (emacs-dsh--content (alist-get 'content message))))
@@ -1700,7 +1733,17 @@ actual creation time.  Read all missing snapshots over one temporary socket."
                      (and (string-empty-p (emacs-dsh--draft-text))
                           (null emacs-dsh--attachments))
                      (yes-or-no-p "Discard unsent DSH draft and switch sessions? "))
-             (emacs-dsh--show id (or (alist-get 'cwd choice) default-directory))
+             (let* ((cwd (or (alist-get 'cwd choice) default-directory))
+                    (local (emacs-dsh--local-path cwd))
+                    (target (if (and local (file-directory-p local))
+                                local (emacs-dsh--project-root)))
+                    (name (format "*emacs-dsh:%s*"
+                                  (file-name-nondirectory (directory-file-name target)))))
+               (when (and (buffer-live-p source)
+                          (not (equal id emacs-dsh--session-id))
+                          (equal (buffer-name source) name))
+                 (kill-buffer source))
+               (emacs-dsh--show id cwd))
              (when (and (buffer-live-p source)
                         (not (eq source (current-buffer))))
                (with-current-buffer source
@@ -2044,6 +2087,37 @@ actual creation time.  Read all missing snapshots over one temporary socket."
        (emacs-dsh--insert-before-input
         (format "[command error %s] %s" draft failure) 'error)))))
 
+(defun emacs-dsh--permission-command ()
+  "Choose a Host-advertised permission for the current session."
+  (emacs-dsh--call
+   "permissionPresets/catalog" (make-hash-table)
+   (lambda (catalog)
+     (let ((choices (mapcar (lambda (item)
+                              (cons (format "%s (%s)"
+                                            (alist-get 'name item)
+                                            (alist-get 'value item))
+                                    (alist-get 'value item)))
+                            (alist-get 'options catalog))))
+       (if choices
+           (emacs-dsh--defer-picker
+            (lambda ()
+              (when-let* ((selection (cdr (assoc (completing-read
+                                                  "DSH permission: " choices nil t)
+                                                 choices))))
+                (emacs-dsh--execute-command
+                 "permission" (concat "/permission " selection) nil))))
+         (message "emacs-dsh: no permissions available"))))
+   (lambda (failure)
+     (message "emacs-dsh: permissions unavailable: %s" failure))))
+
+;;;###autoload
+(defun emacs-dsh-permission ()
+  "Choose a permission preset for this DSH session."
+  (interactive)
+  (unless (and (derived-mode-p 'emacs-dsh-chat-mode) emacs-dsh--session-id)
+    (user-error "Not in a DSH chat"))
+  (emacs-dsh--permission-command))
+
 (defun emacs-dsh--help-command (draft)
   "Display the available native commands and local controls."
   (emacs-dsh--call
@@ -2107,6 +2181,8 @@ actual creation time.  Read all missing snapshots over one temporary socket."
       (emacs-dsh--replace-draft "")
       (emacs-dsh--insert-before-input (string-trim (substring-no-properties
                                                     (emacs-dsh--state))) 'shadow))
+     ((equal name "permission")
+      (emacs-dsh--execute-command name draft mode))
      ((equal name "help") (emacs-dsh--help-command draft))
      (t (emacs-dsh--execute-command name draft mode)))))
 

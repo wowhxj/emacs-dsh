@@ -52,6 +52,21 @@
       (call-interactively (key-binding (kbd "i"))))
     (should (equal (emacs-dsh--draft-text) "helloi"))))
 
+(ert-deftest emacs-dsh-composer-multiline-has-no-padding ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--compose)
+    (should (eq (lookup-key emacs-dsh--input-keymap (kbd "S-<return>"))
+                #'newline))
+    (emacs-dsh--replace-draft "hello")
+    (should (equal (buffer-substring-no-properties
+                    (emacs-dsh--draft-beginning) (point-max)) "hello\n"))
+    (should (eq (plist-get (overlay-get emacs-dsh--input-background 'face)
+                           :extend) t))
+    (goto-char (emacs-dsh--draft-beginning))
+    (call-interactively (key-binding (kbd "S-<return>")))
+    (should (equal (widget-value (emacs-dsh--input-widget)) "\nhello"))))
+
 (ert-deftest emacs-dsh-return-submits-composer ()
   (with-temp-buffer
     (emacs-dsh-chat-mode)
@@ -240,6 +255,24 @@
         (should (equal (alist-get 'data (aref content 1)) "aGVsbG8="))
         (should-not emacs-dsh--attachments)
         (should-not (overlay-get emacs-dsh--attachment-overlay 'before-string))))))
+
+(ert-deftest emacs-dsh-submitted-image-renders-in-history ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--compose)
+    (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) t))
+              ((symbol-function 'create-image)
+               (lambda (&rest _) '(image :type png))))
+      (emacs-dsh--event
+       '((type . "user/message") (seq . 1)
+         (data . ((content . [((type . "text") (text . "See this"))
+                              ((type . "image") (mediaType . "image/png")
+                               (data . "aGVsbG8="))])))))
+      (goto-char (point-min))
+      (search-forward "[image]")
+      (should (equal (get-text-property (- (point) 7) 'display)
+                     '(image :type png)))
+      (should (string-match-p "See this" (buffer-string))))))
 
 (ert-deftest emacs-dsh-image-preview-click-removes-only-selected-image ()
   (with-temp-buffer
@@ -734,6 +767,56 @@
       (should (equal (alist-get 'line (cdr call)) "/permission"))
       (should (equal (alist-get 'submittedAttachments (cdr call)) []))
       (should (equal (emacs-dsh--draft-text) "")))))
+
+(ert-deftest emacs-dsh-permission-picker-uses-host-catalog ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (setq-local emacs-dsh--session-id "s1")
+    (emacs-dsh--compose)
+    (let (requested)
+      (cl-letf (((symbol-function 'emacs-dsh--defer-picker)
+                 (lambda (callback) (funcall callback)))
+                ((symbol-function 'completing-read)
+                 (lambda (_prompt choices &rest _)
+                   (should (equal (mapcar #'cdr choices)
+                                  '("read-only" "workspace-write"
+                                    "danger-full-access" "auto")))
+                   (caar (last choices))))
+                ((symbol-function 'emacs-dsh--call)
+                 (lambda (endpoint args success &optional _error)
+                   (pcase endpoint
+                     ("permissionPresets/catalog"
+                      (funcall success
+                               '((options . [((value . "read-only") (name . "Read only"))
+                                             ((value . "workspace-write") (name . "Workspace write"))
+                                             ((value . "danger-full-access") (name . "Full access"))
+                                             ((value . "auto") (name . "Auto review"))]))))
+                     ("commands/execute"
+                      (setq requested args)
+                      (funcall success '((result . ((kind . "success") (text . "ok"))))))))))
+        (emacs-dsh-permission))
+      (should (equal (alist-get 'line requested) "/permission auto"))
+      (should (equal (alist-get 'agentId requested) "s1")))))
+
+(ert-deftest emacs-dsh-permission-picker-only-offers-installed-options ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (setq-local emacs-dsh--session-id "s1")
+    (emacs-dsh--compose)
+    (let (choices)
+      (cl-letf (((symbol-function 'emacs-dsh--defer-picker)
+                 (lambda (callback) (funcall callback)))
+                ((symbol-function 'completing-read)
+                 (lambda (_prompt offered &rest _)
+                   (setq choices (mapcar #'cdr offered))
+                   ""))
+                ((symbol-function 'emacs-dsh--call)
+                 (lambda (endpoint _args success &optional _error)
+                   (should (equal endpoint "permissionPresets/catalog"))
+                   (funcall success
+                            '((options . [((value . "read-only") (name . "Read only"))]))))))
+        (emacs-dsh-permission))
+      (should (equal choices '("read-only"))))))
 
 (ert-deftest emacs-dsh-unknown-slash-keeps-draft ()
   (with-temp-buffer
@@ -1291,6 +1374,30 @@
           (should-not (buffer-live-p origin)))
       (when (buffer-live-p origin) (kill-buffer origin))
       (when (buffer-live-p target) (kill-buffer target)))))
+
+(ert-deftest emacs-dsh-resume-reuses-name-for-same-directory ()
+  (let ((emacs-dsh--chats (make-hash-table :test #'equal))
+        (source (generate-new-buffer "*emacs-dsh:test-dir*")))
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer source)
+          (emacs-dsh-chat-mode)
+          (setq-local emacs-dsh--session-id "new" emacs-dsh--root "/tmp/test-dir")
+          (emacs-dsh--compose)
+          (cl-letf (((symbol-function 'emacs-dsh--defer-picker)
+                     (lambda (callback) (funcall callback)))
+                    ((symbol-function 'completing-read)
+                     (lambda (_prompt choices &rest _) (caar choices)))
+                    ((symbol-function 'file-directory-p) (lambda (&rest _) t))
+                    ((symbol-function 'emacs-dsh--follow) #'ignore)
+                    ((symbol-function 'emacs-dsh--events-connect) #'ignore)
+                    ((symbol-function 'emacs-dsh--refresh-model-selection) #'ignore))
+            (emacs-dsh--resume-picker
+             '(((sessionId . "old") (cwd . "/tmp/test-dir")))))
+          (should (equal (buffer-name) "*emacs-dsh:test-dir*"))
+          (should-not (buffer-live-p source))
+          (kill-buffer (current-buffer)))
+      (when (buffer-live-p source) (kill-buffer source)))))
 
 (ert-deftest emacs-dsh-resume-cancel-keeps-unsent-draft ()
   (let ((origin (generate-new-buffer " *dsh-unsent*")))
