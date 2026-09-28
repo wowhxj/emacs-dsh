@@ -55,6 +55,7 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 | --- | --- |
 | `M-x emacs-dsh-chat` 或 `<f7>` | 选择目录并创建新会话；`C-u M-x emacs-dsh-chat` 可在创建前选择模式 |
 | `C-c C-r` 或 `/resume` | 在 minibuffer 中搜索 Host 列出的所有工作区的会话（可用 Vertico/Orderless）；按时间、session ID、工作目录和首句交互对齐显示；恢复后关闭原聊天 buffer（未发送的输入会先确认） |
+| `i`（光标不在输入框时） | 跳到输入框已有文字末尾；在输入框内仍正常输入 `i` |
 | `RET` 或 `C-c C-c` | 发送输入 |
 | `C-c C-s` / `C-c C-k` | 运行中 steer / 取消轮次 |
 | `C-c C-l` 或 `/queue` | 查看待发送与 steer 消息，并可编辑、删除或把排队消息转为 steer |

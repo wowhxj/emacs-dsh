@@ -571,6 +571,7 @@ An existing but invalid bridge must fail validation, not silently fall back."
 (defvar emacs-dsh-chat-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") #'emacs-dsh-send)
+    (define-key map (kbd "i") #'emacs-dsh-focus-input)
     (define-key map (kbd "C-c C-c") #'emacs-dsh-send)
     (define-key map (kbd "C-c C-s") #'emacs-dsh-steer)
     (define-key map (kbd "C-c C-k") #'emacs-dsh-cancel)
@@ -710,6 +711,14 @@ An existing but invalid bridge must fail validation, not silently fall back."
 
 (defun emacs-dsh--input-widget ()
   (and emacs-dsh--draft (widget-get emacs-dsh--draft :from) emacs-dsh--draft))
+
+(defun emacs-dsh-focus-input ()
+  "Move point to the end of the chat composer."
+  (interactive)
+  (let ((widget (emacs-dsh--input-widget)))
+    (unless widget (user-error "Not in a DSH chat"))
+    (goto-char (+ (emacs-dsh--draft-beginning)
+                  (length (string-trim-right (widget-value widget)))))))
 
 (defun emacs-dsh--draft-text ()
   (let ((widget (emacs-dsh--input-widget)))

@@ -36,6 +36,22 @@
     (goto-char (point-min))
     (should-error (insert "overwrite"))))
 
+(ert-deftest emacs-dsh-i-focuses-composer-without-changing-draft ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--insert-before-input "History")
+    (emacs-dsh--compose)
+    (emacs-dsh--replace-draft "hello")
+    (goto-char (point-min))
+    (should (eq (key-binding (kbd "i")) #'emacs-dsh-focus-input))
+    (call-interactively (key-binding (kbd "i")))
+    (should (= (point) (+ (emacs-dsh--draft-beginning) 5)))
+    (should (equal (emacs-dsh--draft-text) "hello"))
+    (should (eq (key-binding (kbd "i")) #'self-insert-command))
+    (let ((last-command-event ?i))
+      (call-interactively (key-binding (kbd "i"))))
+    (should (equal (emacs-dsh--draft-text) "helloi"))))
+
 (ert-deftest emacs-dsh-return-submits-composer ()
   (with-temp-buffer
     (emacs-dsh-chat-mode)
