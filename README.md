@@ -33,6 +33,12 @@ bridge 将启动 URL 用当前 Windows 用户的 DPAPI 加密后保存。WSL Ema
 
 Emacs 和 Host 直接使用 POSIX 路径，不需要 PowerShell 或 `wslpath`。bridge 在 macOS 上将启动 URL 写入本机文件，因此启用前要确保 DSH home 是当前用户专用目录，例如 `chmod 700 ~/.dsh`；bridge 文件以 `0600` 权限创建。若使用自定义 `DSH_HOME`，请让 Emacs 和 Host 使用同一个值。
 
+macOS Desktop 首次安装 Host bridge：
+
+1. 在终端运行 `chmod 700 ~/.dsh`。若 Mac 上还没有本仓库源码，运行 `git clone https://github.com/wowhxj/emacs-dsh.git ~/sandbox/emacs-dsh`；已有源码则直接使用现有目录。
+2. 在 DSH Desktop 左侧打开 **Plugins**，选择安装插件，在安装输入框填入本地 `host-bridge` 目录的**绝对路径**，例如 `/Users/randolph/sandbox/emacs-dsh/host-bridge`。安装后确认 `emacs-dsh-host-bridge` 已启用，并重启 App 和 Host。只把 `emacs-dsh.el` 安装进 Emacs 不会完成这一步。
+3. 运行 `test -f ~/.dsh/emacs-dsh-bridge.json && echo ready || echo missing`。看到 `ready` 后再启动 `M-x emacs-dsh-chat`。不要用 `cat` 输出 bridge 文件，其中含有启动令牌。
+
 macOS 的代码路径已有回归测试，但目前尚未在真实 macOS Host 上完成端到端验证。
 
 ## 使用
