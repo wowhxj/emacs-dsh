@@ -16,6 +16,53 @@
     (should (string-match-p "You: hello" (buffer-string)))
     (should (equal (emacs-dsh--draft-text) "hello"))))
 
+(ert-deftest emacs-dsh-prompt-history-navigation ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--compose)
+    (dolist (entry '((1 "first") (2 "second")))
+      (emacs-dsh--event
+       `((type . "user/message") (seq . ,(car entry))
+         (data . ((content . (((type . "text") (text . ,(cadr entry))))))))))
+    (should (equal emacs-dsh--prompt-history '("second" "first")))
+    (emacs-dsh--replace-draft "unfinished\ndraft")
+    (call-interactively (key-binding (kbd "M-n")))
+    (should (equal (widget-value (emacs-dsh--input-widget))
+                   "unfinished\ndraft"))
+    (goto-char (point-min))
+    (should (eq (key-binding (kbd "M-p")) #'emacs-dsh-previous-prompt))
+    (call-interactively (key-binding (kbd "M-p")))
+    (should (equal (widget-value (emacs-dsh--input-widget)) "second"))
+    (should (eq (key-binding (kbd "M-n")) #'emacs-dsh-next-prompt))
+    (call-interactively (key-binding (kbd "M-p")))
+    (should (equal (widget-value (emacs-dsh--input-widget)) "first"))
+    (call-interactively (key-binding (kbd "M-n")))
+    (should (equal (widget-value (emacs-dsh--input-widget)) "second"))
+    (call-interactively (key-binding (kbd "M-n")))
+    (should (equal (widget-value (emacs-dsh--input-widget))
+                   "unfinished\ndraft"))
+    (goto-char (emacs-dsh--draft-beginning))
+    (should (eq (key-binding (kbd "M-p")) #'emacs-dsh-previous-prompt))
+    (call-interactively (key-binding (kbd "M-p")))
+    (should (equal (widget-value (emacs-dsh--input-widget)) "second"))))
+
+(ert-deftest emacs-dsh-prompt-history-ignores-runtime-and-images ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--compose)
+    (emacs-dsh--event
+     '((type . "user/message") (seq . 1)
+       (data . ((source . ((kind . "runtime-context")))
+                (content . (((type . "text") (text . "hidden"))))))))
+    (emacs-dsh--event
+     '((type . "user/message") (seq . 2)
+       (data . ((content . (((type . "image") (data . "aGVsbG8="))))))))
+    (emacs-dsh--event
+     '((type . "user/message") (seq . 3)
+       (data . ((content . (((type . "text") (text . "visible"))
+                            ((type . "image") (data . "aGVsbG8="))))))))
+    (should (equal emacs-dsh--prompt-history '("visible")))))
+
 (ert-deftest emacs-dsh-composer-accepts-typing-and-protects-history ()
   (with-temp-buffer
     (emacs-dsh-chat-mode)
@@ -111,6 +158,90 @@
       (emacs-dsh--event event)
       (should (= 1 (cl-count-if (lambda (line) (string-prefix-p "DSH: hello" line))
                                 (split-string (buffer-string) "\n")))))))
+
+(ert-deftest emacs-dsh-direct-final-reply-needs-no-process-fold ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--compose)
+    (emacs-dsh--event
+     '((type . "user/message") (seq . 1)
+       (data . ((content . (((type . "text") (text . "hi"))))))))
+    (emacs-dsh--event '((type . "turn/start") (seq . 2)))
+    (emacs-dsh--event
+     `((type . "assistant/message") (seq . 3)
+       (data . ((message . ((content . ,(list '((type . "text")
+                                              (text . "hello"))))))))))
+    (emacs-dsh--event '((type . "turn/end") (seq . 4)))
+    (should-not (string-match-p "Process (RET" (buffer-string)))))
+
+(ert-deftest emacs-dsh-process-fold-keeps-last-assistant-message ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--compose)
+    (emacs-dsh--event
+     '((type . "user/message") (seq . 1)
+       (data . ((content . (((type . "text") (text . "question"))))))))
+    (emacs-dsh--event '((type . "turn/start") (seq . 2)))
+    (emacs-dsh--event
+     `((type . "assistant/message") (seq . 3)
+       (data . ((message . ((content . ,(list '((type . "text")
+                                              (text . "intermediate"))))))))))
+    (emacs-dsh--event
+     `((type . "assistant/message") (seq . 4)
+       (data . ((message . ((content . ,(list '((type . "text")
+                                              (text . "final"))))))))))
+    (emacs-dsh--event '((type . "turn/end") (seq . 5)))
+    (goto-char (point-min))
+    (search-forward "Process (RET")
+    (let ((body (cl-loop for ov in (overlays-at (1- (point)))
+                         thereis (overlay-get ov 'emacs-dsh-process))))
+      (should body)
+      (should (string-match-p "DSH: intermediate"
+                              (buffer-substring-no-properties
+                               (overlay-start body) (overlay-end body))))
+      (should-not (string-match-p "DSH: final"
+                                  (buffer-substring-no-properties
+                                   (overlay-start body) (overlay-end body)))))))
+
+(ert-deftest emacs-dsh-final-reply-folds-intermediate-process ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--compose)
+    (emacs-dsh--event
+     '((type . "user/message") (seq . 1)
+       (data . ((content . (((type . "text") (text . "question"))))))))
+    (emacs-dsh--event '((type . "turn/start") (seq . 2)))
+    (emacs-dsh--event
+     '((type . "tool/call") (seq . 3)
+       (data . ((callId . "c1") (name . "run_code")
+                (arguments . "lots of process")))))
+    (emacs-dsh--event
+     `((type . "assistant/message") (seq . 4)
+       (data . ((message . ((content . ,(list '((type . "text")
+                                              (text . "final answer"))))))))))
+    (should (string-match-p "DSH: final answer" (buffer-string)))
+    (should-not (string-match-p "Process (RET" (buffer-string)))
+    (emacs-dsh--event '((type . "turn/end") (seq . 5)))
+    (should (string-match-p "You: question" (buffer-string)))
+    (should (string-match-p "DSH: final answer" (buffer-string)))
+    (goto-char (point-min))
+    (search-forward "Process (RET")
+    (let* ((header (cl-find-if (lambda (ov) (overlay-get ov 'emacs-dsh-process))
+                               (overlays-at (1- (point)))))
+           (body (overlay-get header 'emacs-dsh-process)))
+      (should header)
+      (should (eq (overlay-get body 'invisible) 'emacs-dsh-process))
+      (should (string-match-p "lots of process"
+                              (buffer-substring-no-properties
+                               (overlay-start body) (overlay-end body))))
+      (should (<= (overlay-end body)
+                  (save-excursion (goto-char (point-min))
+                                  (search-forward "DSH: final answer"))))
+      (goto-char (overlay-start header))
+      (emacs-dsh-toggle-process)
+      (should-not (overlay-get body 'invisible))
+      (emacs-dsh-toggle-process)
+      (should (eq (overlay-get body 'invisible) 'emacs-dsh-process)))))
 
 (ert-deftest emacs-dsh-follow-shape-and-history-order ()
   (with-temp-buffer
@@ -861,7 +992,8 @@
                 emacs-dsh--model-selection
                 '((provider . "deepseek") (model . "v4") (reasoningEffort . "high")))
     (emacs-dsh--compose)
-    (should-not (bound-and-true-p tab-line-mode))
+    (should (bound-and-true-p tab-line-mode))
+    (should (equal tab-line-format '(:eval (emacs-dsh--header))))
     (should (member '(:eval (emacs-dsh--state)) mode-line-misc-info))
     (let ((status (emacs-dsh--state)))
       (should (string-match-p "DSH idle" status))
@@ -919,6 +1051,33 @@
       (should finished)
       (should (= (gethash "s1" emacs-dsh--created-at) 1790545330332))
       (should (= (gethash "s2" emacs-dsh--created-at) 1790545330332)))))
+
+(ert-deftest emacs-dsh-at-completion-accepts-home-and-absolute-paths ()
+  (let ((external (make-temp-file "dsh-mention" t))
+        (root (make-temp-file "dsh-root" t)))
+    (unwind-protect
+        (progn
+          (write-region "test" nil (expand-file-name "outside.txt" external))
+          (make-directory (expand-file-name "subdir" external))
+          (with-temp-buffer
+            (emacs-dsh-chat-mode)
+            (setq-local emacs-dsh--root root emacs-dsh--session-id "s1")
+            (emacs-dsh--compose)
+            (dolist (query (list (concat "@" external "/outside")
+                                 (concat "@~/" (file-relative-name external (expand-file-name "~"))
+                                         "/outside")))
+              (emacs-dsh--replace-draft query)
+              (emacs-dsh-focus-input)
+              (cl-letf (((symbol-function 'emacs-dsh--call)
+                         (lambda (&rest _) (error "Should complete local path without Host RPC"))))
+                (emacs-dsh-complete))
+              (should (string-suffix-p "outside.txt" (emacs-dsh--draft-text))))
+            (emacs-dsh--replace-draft (concat "@" external "/subd"))
+            (emacs-dsh-focus-input)
+            (emacs-dsh-complete)
+            (should (string-suffix-p "subdir/" (emacs-dsh--draft-text)))))
+      (delete-directory external t)
+      (delete-directory root t))))
 
 (ert-deftest emacs-dsh-at-completion-uses-host-paths ()
   (with-temp-buffer
@@ -985,7 +1144,8 @@
       (cl-letf (((symbol-function 'emacs-dsh--call)
                  (lambda (endpoint args success &optional _on-error)
                    (setq sent (cons endpoint args)) (funcall success t))))
-        (emacs-dsh--queue-update '((id . "q1")) "edit" "new text"))
+        (emacs-dsh--queue-update
+         '((id . "q1")) "edit" '(((type . "text") (text . "new text")))))
       (should (equal (car sent) "session/updateQueue"))
       (let* ((request (alist-get 'request (cdr sent)))
              (action (alist-get 'action request)))
@@ -994,6 +1154,54 @@
         (should (equal (alist-get 'kind action) "edit"))
         (should (equal (alist-get 'text (aref (alist-get 'content action) 0))
                        "new text"))))))
+
+(ert-deftest emacs-dsh-queue-edit-mixed-content-can-remove-image ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (setq-local emacs-dsh--session-id "s1" emacs-dsh--queue-ready t)
+    (let* ((image '((type . "image") (mediaType . "image/png")
+                    (name . "screenshot.png") (data . "aGVsbG8=")))
+           (item `((id . "q1")
+                   (content . (((type . "text") (text . "original")) ,image))))
+           (emacs-dsh--queue-items (list (cons 'queued item)))
+           sent)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt choices &rest _args) (caar choices)))
+                ((symbol-function 'read-string)
+                 (lambda (_prompt _initial &rest _) "revised"))
+                ((symbol-function 'y-or-n-p) (lambda (_prompt) nil))
+                ((symbol-function 'emacs-dsh--call)
+                 (lambda (_endpoint args success &optional _error)
+                   (setq sent (alist-get 'content
+                                         (alist-get 'action (alist-get 'request args))))
+                   (funcall success t))))
+        (emacs-dsh-queue))
+      (should (equal (alist-get 'text (aref sent 0)) "revised"))
+      (should (= (length sent) 1)))))
+
+(ert-deftest emacs-dsh-queue-edit-mixed-content-can-keep-image ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (setq-local emacs-dsh--session-id "s1" emacs-dsh--queue-ready t)
+    (let* ((image '((type . "image") (mediaType . "image/png")
+                    (name . "original.png") (data . "aGVsbG8=")))
+           (item `((id . "q1") (content . (((type . "text") (text . "before"))
+                                           ,image))))
+           (emacs-dsh--queue-items (list (cons 'queued item)))
+           sent)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt choices &rest _args) (caar choices)))
+                ((symbol-function 'read-string)
+                 (lambda (_prompt _initial &rest _) "after"))
+                ((symbol-function 'y-or-n-p) (lambda (_prompt) t))
+                ((symbol-function 'emacs-dsh--call)
+                 (lambda (_endpoint args success &optional _error)
+                   (setq sent (alist-get 'content
+                                         (alist-get 'action (alist-get 'request args))))
+                   (funcall success t))))
+        (emacs-dsh-queue))
+      (should (equal (alist-get 'text (aref sent 0)) "after"))
+      (should (equal (aref sent 1) image)))))
 
 (ert-deftest emacs-dsh-control-frame-routes-only-current-session ()
   (with-temp-buffer
@@ -1241,13 +1449,68 @@
               (with-current-buffer buffer (should-not emacs-dsh--waiting)))
         (kill-buffer buffer)))))
 
+(ert-deftest emacs-dsh-default-permission-chooses-auto-or-full-access ()
+  (dolist (case '((((value . "read-only") (name . "read"))
+                   ((value . "auto") (name . "Auto")))
+                  (((value . "read-only") (name . "read")))))
+    (let (created selected shown)
+      (cl-letf (((symbol-function 'emacs-dsh--call)
+                 (lambda (endpoint args success &optional _error)
+                   (pcase endpoint
+                     ("session/create" (setq created args)
+                      (funcall success '((sessionId . "session-1"))))
+                     ("permissionPresets/catalog"
+                      (funcall success `((options . ,case))))
+                     ("commands/execute" (setq selected args)
+                      (funcall success '((result . ((kind . "success")))))))))
+                ((symbol-function 'emacs-dsh--show)
+                 (lambda (session root) (setq shown (list session root)))))
+        (emacs-dsh--create-session "/tmp/" nil))
+      (should (equal (alist-get 'cwd (alist-get 'request created)) "/tmp/"))
+      (should (equal (alist-get 'agentId selected) "session-1"))
+      (should (equal (alist-get 'line selected)
+                     (concat "/permission " (if (assoc 'value (cadr case))
+                                               "auto" "danger-full-access"))))
+      (should (equal shown '("session-1" "/tmp/"))))))
+
+(ert-deftest emacs-dsh-default-permission-catalog-error-uses-full-access ()
+  (let (selected shown)
+    (cl-letf (((symbol-function 'emacs-dsh--call)
+               (lambda (endpoint args success &optional failure)
+                 (pcase endpoint
+                   ("session/create" (funcall success '((sessionId . "s1"))))
+                   ("permissionPresets/catalog" (funcall failure "unavailable"))
+                   ("commands/execute" (setq selected (alist-get 'line args))
+                    (funcall success '((result . ((kind . "success")))))))))
+              ((symbol-function 'emacs-dsh--show)
+               (lambda (id _root) (setq shown id))))
+      (emacs-dsh--create-session "/tmp/" nil))
+    (should (equal selected "/permission danger-full-access"))
+    (should (equal shown "s1"))))
+
+(ert-deftest emacs-dsh-default-permission-respects-custom-setting ()
+  (let ((emacs-dsh-default-permission "read-only") permission)
+    (cl-letf (((symbol-function 'emacs-dsh--call)
+               (lambda (_endpoint args success &optional _error)
+                 (setq permission (alist-get 'line args))
+                 (funcall success '((result . ((kind . "success")))))))
+              ((symbol-function 'emacs-dsh--show) (lambda (&rest _) nil)))
+      (emacs-dsh--set-default-permission
+       "s1" '((options . (((value . "auto"))))) "/tmp/"))
+    (should (equal permission "/permission read-only"))))
+
 (ert-deftest emacs-dsh-create-session-preset-and-context-projection ()
   (let (created)
     (cl-letf (((symbol-function 'emacs-dsh--call)
                (lambda (endpoint args success &optional _error)
-                 (should (equal endpoint "session/create"))
-                 (setq created args)
-                 (funcall success '((sessionId . "s1")))))
+                  (pcase endpoint
+                    ("session/create"
+                     (setq created args)
+                     (funcall success '((sessionId . "s1"))))
+                    ("permissionPresets/catalog"
+                     (funcall success '((options . (((value . "auto")))))))
+                    ("commands/execute"
+                     (funcall success '((result . ((kind . "success")))))))))
               ((symbol-function 'emacs-dsh--show) (lambda (&rest _) nil)))
       (emacs-dsh--create-session "/tmp/" "code"))
     (should (equal (alist-get 'agentPreset (alist-get 'request created)) "code")))
@@ -1264,6 +1527,23 @@
                                         (value . ((pressureTokens . 6400)
                                                   (contextWindow . 128000)))))))))
     (should (string-match-p "6.4k/128.0k" (emacs-dsh--header)))))
+
+(ert-deftest emacs-dsh-latest-prompt-is-pinned-below-status ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--compose)
+    (should (equal tab-line-format '(:eval (emacs-dsh--header))))
+    (should (equal header-line-format '(:eval (emacs-dsh--pinned-prompt))))
+    (emacs-dsh--event
+     '((type . "user/message") (seq . 1)
+       (data . ((content . (((type . "text")
+                            (text . "Why does this happen?\nPlease explain"))))))))
+    (let ((pinned (emacs-dsh--pinned-prompt)))
+      (should (string-prefix-p "You: Why does this happen?" pinned))
+      (should (string-match-p "Please explain" pinned))
+      (should-not (string-match-p "\n" pinned)))
+    (emacs-dsh--event '((type . "turn/start") (seq . 2)))
+    (should (string-prefix-p "You: Why" (emacs-dsh--pinned-prompt)))))
 
 (ert-deftest emacs-dsh-agent-activity-mode-line ()
   (with-temp-buffer

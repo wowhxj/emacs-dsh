@@ -56,19 +56,20 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 | `M-x emacs-dsh-chat` 或 `<f7>` | 选择目录并创建新会话；`C-u M-x emacs-dsh-chat` 可在创建前选择模式 |
 | `C-c C-r` 或 `/resume` | 在 minibuffer 中搜索 Host 列出的所有工作区的会话（可用 Vertico/Orderless）；按时间、session ID、工作目录和首句交互对齐显示；恢复后关闭原聊天 buffer（未发送的输入会先确认） |
 | `i`（光标不在输入框时） | 跳到输入框已有文字末尾；在输入框内仍正常输入 `i` |
+| `M-p` / `M-n` | 上翻／下翻当前会话的用户 prompt 历史；下翻到末尾会恢复未发送的草稿 |
 | `RET` 或 `C-c C-c` | 发送输入 |
 | `Shift-Enter` | 在输入框插入换行，不发送 |
 | `C-c C-s` / `C-c C-k` | 运行中 steer / 取消轮次 |
-| `C-c C-l` 或 `/queue` | 查看待发送与 steer 消息，并可编辑、删除或把排队消息转为 steer |
+| `C-c C-l` 或 `/queue` | 查看待发送与 steer 消息，编辑图文消息的文字并逐张选择保留／删除图片，也可删除消息或转为 steer |
 | `C-c C-q` | 关闭 Emacs 聊天 buffer，不删除 Host 会话 |
 | `/mode` 或 `M-x emacs-dsh-select-mode` | 为**尚未开始对话**的会话选择模式（Standard、PTC、Minimal、Creator，按 Host 实际可用模式显示） |
 | `M-x emacs-dsh-permission` 或 `/permission <预设>` | 为当前会话选择权限：仅查看、工作区修改、完全权限；Host 提供时还可选 Auto review（值为 `auto`） |
-| `TAB` | 补全 `/` 命令、技能或 `@` 文件及跨会话引用 |
+| `TAB` | 补全 `/` 命令、技能、`@` 项目文件／会话引用；输入 `@~/sandbox/` 或 `@/absolute/path/` 时可补全项目外任意目录中的文件和文件夹 |
 | `C-c C-p`、`s-v` 或 `s-V` | 智能粘贴文本、文件引用或图片 |
 
 输入框底色只作视觉填充，不在草稿中添加补齐空格；`C-e` 可直接到当前输入行末。
 
-顶部状态行显示上下文 token 使用量（Host 提供时）、模型、推理程度和模式；Emacs 原有 mode-line 的聊天 buffer 名显示工作目录（同名目录的多个会话会自动编号），并追加 DSH 空闲/思考/工具执行/等待操作的动态状态及队列数量（`Q` 为待发送、`S` 为 steer）。最近一条用户 query 保留在聊天记录中。新会话会自动读取 Host 默认模型。`/model` 可选择模型，`/reasoning` 可选择当前模型支持的思考程度。`/help` 显示客户端命令及 Host 提供的命令；其他 Host 命令由 `commands/list` 发现并交给 Host 执行。已注册的 `/skill-name` 作为 prompt 提交。
+顶部第一行显示上下文 token 使用量（Host 提供时）、模型、推理程度和模式；第二行固定显示最近一条用户 prompt，长 prompt 会截断以保持单行，聊天记录滚动时仍可见。收到最终回复后，本轮工具调用等中间过程自动折叠为 `Process`，把光标放在标题上按 `RET` 或点击可展开／再次折叠。新建会话默认选择 `auto` 权限（Host 未提供时使用 `danger-full-access`），可通过 `emacs-dsh-default-permission` 自定义；Emacs 原有 mode-line 的聊天 buffer 名显示工作目录（同名目录的多个会话会自动编号），并追加 DSH 空闲/思考/工具执行/等待操作的动态状态及队列数量（`Q` 为待发送、`S` 为 steer）。最近一条用户 query 保留在聊天记录中。新会话会自动读取 Host 默认模型。`/model` 可选择模型，`/reasoning` 可选择当前模型支持的思考程度。`/help` 显示客户端命令及 Host 提供的命令；其他 Host 命令由 `commands/list` 发现并交给 Host 执行。已注册的 `/skill-name` 作为 prompt 提交。
 
 助手回复使用 `markdown-mode` 的 Emacs 原生样式显示标题、强调、代码和链接，并隐藏部分 Markdown 标记；buffer 中仍保留原文，复制和搜索得到的是原始 Markdown。HTTP(S) 链接可用 `RET` 或鼠标点击打开。流式回复先以轻量文本显示，消息完成后再排版。工具调用显示为带状态和参数摘要的卡片：`●` 运行中、`✓` 成功、`✗` 失败；把光标移到卡片标题后按 `RET` 或点击，可展开/收起完整参数和结果。
 

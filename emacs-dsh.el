@@ -84,6 +84,12 @@ and on macOS, nil sends paths unchanged."
   :type 'integer :group 'emacs-dsh)
 (defcustom emacs-dsh-show-reasoning nil
   "Whether to display assistant reasoning blocks." :type 'boolean :group 'emacs-dsh)
+(defcustom emacs-dsh-default-permission "auto"
+  "Permission for newly created sessions; auto falls back to danger-full-access.
+The fallback is used only when the Host does not offer auto."
+  :type '(choice (const "auto") (const "danger-full-access")
+                 (const "workspace-write") (const "read-only"))
+  :group 'emacs-dsh)
 
 (defvar emacs-dsh--chats (make-hash-table :test #'equal))
 (defvar emacs-dsh--created-at (make-hash-table :test #'equal)
@@ -112,6 +118,12 @@ and on macOS, nil sends paths unchanged."
 (defvar-local emacs-dsh--input-background nil)
 (defvar-local emacs-dsh--stream-overlay nil)
 (defvar-local emacs-dsh--last-prompt nil)
+(defvar-local emacs-dsh--turn-start nil)
+(defvar-local emacs-dsh--final-start nil)
+(defvar-local emacs-dsh--turn-has-process nil)
+(defvar-local emacs-dsh--prompt-history nil)
+(defvar-local emacs-dsh--history-index nil)
+(defvar-local emacs-dsh--history-draft nil)
 (defvar-local emacs-dsh--running nil)
 (defvar-local emacs-dsh--stream-text nil)
 (defvar-local emacs-dsh--stream-id nil)
@@ -573,6 +585,8 @@ An existing but invalid bridge must fail validation, not silently fall back."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") #'emacs-dsh-send)
     (define-key map (kbd "i") #'emacs-dsh-focus-input)
+    (define-key map (kbd "M-p") #'emacs-dsh-previous-prompt)
+    (define-key map (kbd "M-n") #'emacs-dsh-next-prompt)
     (define-key map (kbd "C-c C-c") #'emacs-dsh-send)
     (define-key map (kbd "C-c C-s") #'emacs-dsh-steer)
     (define-key map (kbd "C-c C-k") #'emacs-dsh-cancel)
@@ -593,6 +607,8 @@ An existing but invalid bridge must fail validation, not silently fall back."
     (define-key map (kbd "RET") #'emacs-dsh-send)
     (define-key map (kbd "S-<return>") #'newline)
     (define-key map (kbd "S-RET") #'newline)
+    (define-key map (kbd "M-p") #'emacs-dsh-previous-prompt)
+    (define-key map (kbd "M-n") #'emacs-dsh-next-prompt)
     (define-key map (kbd "C-c C-c") #'emacs-dsh-send)
     (define-key map (kbd "C-c C-s") #'emacs-dsh-steer)
     (define-key map (kbd "C-c C-k") #'emacs-dsh-cancel)
@@ -626,12 +642,17 @@ An existing but invalid bridge must fail validation, not silently fall back."
   (setq-local emacs-dsh--waiting nil)
   (setq-local emacs-dsh--cursor -1)
   (setq-local emacs-dsh--last-prompt nil)
+  (setq-local emacs-dsh--prompt-history nil)
+  (setq-local emacs-dsh--history-index nil)
+  (setq-local emacs-dsh--history-draft nil)
   (setq-local truncate-lines nil)
   (setq-local buffer-invisibility-spec (copy-tree buffer-invisibility-spec))
   (add-to-invisibility-spec 'markdown-markup)
   (add-to-invisibility-spec 'emacs-dsh-tool-details)
-  (setq-local header-line-format '(:eval (emacs-dsh--header)))
-  (tab-line-mode -1)
+  (add-to-invisibility-spec 'emacs-dsh-process)
+  (tab-line-mode 1)
+  (setq-local tab-line-format '(:eval (emacs-dsh--header)))
+  (setq-local header-line-format '(:eval (emacs-dsh--pinned-prompt)))
   (setq-local mode-line-misc-info
               (cons '(:eval (emacs-dsh--state)) mode-line-misc-info))
   (add-hook 'kill-buffer-hook #'emacs-dsh--close nil t))
@@ -656,6 +677,16 @@ An existing but invalid bridge must fail validation, not silently fall back."
                   "model: loading")))
     (concat left " " (propertize " " 'display `(space :align-to (- right ,(string-width right))))
             (replace-regexp-in-string "%" "%%" right))))
+
+(defun emacs-dsh--pinned-prompt ()
+  "Show the latest user prompt below the status row."
+  (when emacs-dsh--last-prompt
+    (propertize
+     (truncate-string-to-width
+      (concat "You: "
+              (replace-regexp-in-string "[\r\n]+" " ⏎ " emacs-dsh--last-prompt))
+      (max 1 (1- (window-width))) nil nil "…")
+     'face 'emacs-dsh-user-face)))
 
 (defun emacs-dsh--state ()
   "Show the agent's activity in the ordinary Emacs mode line."
@@ -727,6 +758,39 @@ An existing but invalid bridge must fail validation, not silently fall back."
     (unless widget (user-error "Not in a DSH chat"))
     (goto-char (+ (emacs-dsh--draft-beginning)
                   (length (string-trim-right (widget-value widget)))))))
+
+(defun emacs-dsh--remember-prompt (text)
+  "Add nonempty TEXT to the current chat's recent prompt history."
+  (when (and (stringp text) (not (string-empty-p (string-trim text)))
+             (not (equal text (car emacs-dsh--prompt-history))))
+    (push text emacs-dsh--prompt-history)
+    (setq emacs-dsh--history-index nil emacs-dsh--history-draft nil)))
+
+(defun emacs-dsh--history-move (direction)
+  "Move DIRECTION steps through prompts, retaining the current draft."
+  (unless (emacs-dsh--input-widget) (user-error "Not in a DSH chat"))
+  (when emacs-dsh--prompt-history
+    (let ((index (or emacs-dsh--history-index -1)))
+      (when (and (= index -1) (> direction 0))
+        (setq emacs-dsh--history-draft
+              (widget-value (emacs-dsh--input-widget))))
+      (setq index (max -1 (min (1- (length emacs-dsh--prompt-history))
+                                (+ index direction))))
+      (setq emacs-dsh--history-index (unless (= index -1) index))
+      (when (or (>= index 0) emacs-dsh--history-draft)
+        (emacs-dsh--replace-draft
+         (if (= index -1) emacs-dsh--history-draft
+           (nth index emacs-dsh--prompt-history)))))))
+
+(defun emacs-dsh-previous-prompt ()
+  "Replace the draft with the previous prompt in this chat."
+  (interactive)
+  (emacs-dsh--history-move 1))
+
+(defun emacs-dsh-next-prompt ()
+  "Replace the draft with the next prompt, or restore the unsent draft."
+  (interactive)
+  (emacs-dsh--history-move -1))
 
 (defun emacs-dsh--draft-text ()
   (let ((widget (emacs-dsh--input-widget)))
@@ -831,6 +895,51 @@ The original characters remain in the transcript for copying and search."
                        (create-image (base64-decode-string data) type t
                                      :max-width 480 :max-height 320)))))
     (if image (propertize "[image]" 'display image) "[image]")))
+
+(defvar emacs-dsh--process-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'emacs-dsh-toggle-process)
+    (define-key map [mouse-1] #'emacs-dsh-toggle-process)
+    map)
+  "Keymap on a folded process heading.")
+
+(defun emacs-dsh--fold-process ()
+  "Collapse the intermediate transcript for the current finished turn."
+  (when (and emacs-dsh--turn-has-process
+             emacs-dsh--turn-start emacs-dsh--final-start
+             (< (marker-position emacs-dsh--turn-start)
+                (marker-position emacs-dsh--final-start)))
+    (let ((inhibit-read-only t))
+      (save-excursion
+        (goto-char emacs-dsh--turn-start)
+        (let ((heading (point)))
+          (insert "▸ Process (RET to expand)\n")
+          (add-text-properties heading (point)
+                               '(read-only t rear-nonsticky (read-only)))
+          (let ((header (make-overlay heading (1- (point)) nil t nil))
+                (body (make-overlay (point) emacs-dsh--final-start nil nil nil)))
+            (overlay-put header 'emacs-dsh-process body)
+            (overlay-put header 'keymap emacs-dsh--process-map)
+            (overlay-put header 'mouse-face 'highlight)
+            (overlay-put header 'help-echo "RET or click: toggle intermediate steps")
+            (overlay-put body 'invisible 'emacs-dsh-process))))))
+  (setq emacs-dsh--turn-start nil emacs-dsh--final-start nil
+        emacs-dsh--turn-has-process nil))
+
+;;;###autoload
+(defun emacs-dsh-toggle-process (&optional event)
+  "Show or hide intermediate steps at point or mouse EVENT."
+  (interactive (list last-input-event))
+  (when (mouse-event-p event) (mouse-set-point event))
+  (let* ((header (cl-find-if (lambda (overlay)
+                               (overlay-get overlay 'emacs-dsh-process))
+                             (overlays-at (point))))
+         (body (and header (overlay-get header 'emacs-dsh-process))))
+    (unless body (user-error "Move to a DSH process heading first"))
+    (let ((hidden (overlay-get body 'invisible)))
+      (overlay-put body 'invisible (unless hidden 'emacs-dsh-process))
+      (overlay-put header 'display (if hidden "▾ Process (RET to collapse)"
+                               "▸ Process (RET to expand)")))))
 
 (defun emacs-dsh--insert-message (label text &optional user content)
   "Insert LABEL and TEXT as a readable transcript message.
@@ -1043,23 +1152,36 @@ Assistant TEXT is rendered as Markdown; USER CONTENT may contain images."
         ("user/message"
          (let* ((message (or (alist-get 'message data) data))
                 (text (emacs-dsh--content (alist-get 'content message))))
-            (when (and (not (string-empty-p text))
-                       (let ((source (alist-get 'source message)))
-                         (or (not source)
-                             (equal (alist-get 'kind source) "user"))))
-              (setq emacs-dsh--last-prompt text)
-               (emacs-dsh--insert-message "You: " text t
-                                          (alist-get 'content message)))))
+           (when (and (not (string-empty-p text))
+                      (let ((source (alist-get 'source message)))
+                        (or (not source)
+                            (equal (alist-get 'kind source) "user"))))
+             (setq emacs-dsh--last-prompt text
+                   emacs-dsh--turn-start nil emacs-dsh--final-start nil
+                   emacs-dsh--turn-has-process nil)
+             (emacs-dsh--remember-prompt
+              (mapconcat (lambda (block)
+                           (if (equal (alist-get 'type block) "text")
+                               (or (alist-get 'text block) "") ""))
+                         (let ((content (alist-get 'content message)))
+                           (if (vectorp content) (append content nil) content)) ""))
+             (emacs-dsh--insert-message "You: " text t
+                                        (alist-get 'content message))
+             (setq emacs-dsh--turn-start (copy-marker emacs-dsh--input-start nil)))))
         ("assistant/message"
          (let* ((message (alist-get 'message data))
                 (text (emacs-dsh--content (alist-get 'content message))))
+           (when (and emacs-dsh--turn-start (not (string-empty-p text)))
+             (when emacs-dsh--final-start (setq emacs-dsh--turn-has-process t))
+             (setq emacs-dsh--final-start (copy-marker emacs-dsh--input-start nil)))
            (setq emacs-dsh--stream-text nil emacs-dsh--stream-id nil)
-            (when emacs-dsh--stream-overlay
-              (overlay-put emacs-dsh--stream-overlay 'before-string nil))
+           (when emacs-dsh--stream-overlay
+             (overlay-put emacs-dsh--stream-overlay 'before-string nil))
            (unless (string-empty-p text)
-              (emacs-dsh--insert-message "DSH: " text))))
+             (emacs-dsh--insert-message "DSH: " text))))
         ("tool/call"
-          (emacs-dsh--tool-call data seq))
+         (setq emacs-dsh--turn-has-process t)
+         (emacs-dsh--tool-call data seq))
         ("tool/result"
           (emacs-dsh--tool-result data))
         ("model/selection"
@@ -1080,9 +1202,15 @@ Assistant TEXT is rendered as Markdown; USER CONTENT may contain images."
                                       (not (alist-get 'reasoningEffort
                                                      (alist-get 'adapterDefaults header))))
                              `((reasoningEffort . ,(format "%s" effort)))))))))
-        ("turn/start" (emacs-dsh--set-running t))
+        ("turn/start"
+          (unless emacs-dsh--turn-start
+            (setq emacs-dsh--turn-start
+                  (copy-marker (or emacs-dsh--input-start (point-max)) nil)))
+          (setq emacs-dsh--final-start nil)
+          (emacs-dsh--set-running t))
         ("turn/end" (setq emacs-dsh--active-tools nil emacs-dsh--waiting nil)
          (emacs-dsh--set-running nil)
+         (emacs-dsh--fold-process)
          (let* ((reason (alist-get 'reason data))
                 (failure (alist-get 'error reason)))
            (emacs-dsh--insert-before-input
@@ -1588,13 +1716,40 @@ MAX-MESSAGES limits history included in the first snapshot."
        (lambda (preset) (emacs-dsh--create-session root preset)))
     (emacs-dsh--create-session root nil)))
 
+(defun emacs-dsh--set-default-permission (session catalog root)
+  "Set SESSION permission from CATALOG before displaying chat ROOT."
+  (let ((permission (if (and (equal emacs-dsh-default-permission "auto")
+                             (not (cl-find "auto" (alist-get 'options catalog)
+                                           :key (lambda (option) (alist-get 'value option))
+                                           :test #'equal)))
+                        "danger-full-access" emacs-dsh-default-permission)))
+    (emacs-dsh--call
+     "commands/execute"
+     `((agentId . ,session) (line . ,(concat "/permission " permission))
+       (submittedAttachments . []))
+     (lambda (value)
+       (let ((result (alist-get 'result value)))
+         (emacs-dsh--show session root)
+         (unless (equal (alist-get 'kind result) "success")
+           (message "emacs-dsh: default permission %s was not accepted" permission))))
+     (lambda (failure)
+       (emacs-dsh--show session root)
+       (message "emacs-dsh: default permission unavailable: %s" failure)))))
+
 (defun emacs-dsh--create-session (root preset)
   "Create a session in ROOT with optional PRESET."
   (emacs-dsh--call
    "session/create"
    `((request . ,(append `((cwd . ,(emacs-dsh--host-path root)))
                           (when preset `((agentPreset . ,preset))))))
-   (lambda (value) (emacs-dsh--show (alist-get 'sessionId value) root))))
+   (lambda (value)
+     (let ((session (alist-get 'sessionId value)))
+       (emacs-dsh--call
+        "permissionPresets/catalog" (make-hash-table)
+        (lambda (catalog)
+          (emacs-dsh--set-default-permission session catalog root))
+        (lambda (_failure)
+          (emacs-dsh--set-default-permission session nil root)))))))
 
 ;;;###autoload
 (defun emacs-dsh-select-mode ()
@@ -1930,6 +2085,7 @@ actual creation time.  Read all missing snapshots over one temporary socket."
          (id (emacs-dsh--uuid)))
     (when (zerop (length content)) (user-error "Write a prompt or attach an image first"))
     (puthash id (cons text images) emacs-dsh--pending)
+    (setq emacs-dsh--history-index nil emacs-dsh--history-draft nil)
     (setq emacs-dsh--attachments nil)
     (emacs-dsh--update-image-preview)
     (emacs-dsh--replace-draft "")
@@ -2214,11 +2370,11 @@ actual creation time.  Read all missing snapshots over one temporary socket."
       "[[:space:]\n\r]+" " "
       (or (emacs-dsh--content content) "[attachment]")))))
 
-(defun emacs-dsh--queue-update (item kind &optional text)
-  "Apply KIND to ITEM, using TEXT for an edit."
+(defun emacs-dsh--queue-update (item kind &optional content)
+  "Apply KIND to ITEM, using CONTENT blocks for an edit."
   (let ((action (append `((kind . ,kind))
                         (when (equal kind "edit")
-                          `((content . [((type . "text") (text . ,text))]))))))
+                          `((content . ,(vconcat content)))))))
     (emacs-dsh--call
      "session/updateQueue"
      `((request . ((sessionId . ,emacs-dsh--session-id)
@@ -2257,15 +2413,24 @@ actual creation time.  Read all missing snapshots over one temporary socket."
         (when kind
           (if (equal kind "edit")
               (let* ((content (alist-get 'content item))
-                     (text-only (cl-every (lambda (part)
-                                            (equal (alist-get 'type part) "text"))
-                                          content)))
-                (unless text-only (user-error "Only text-only queue items can be edited"))
-                (let ((new (read-string "Edit queued message: "
-                                        (emacs-dsh--content content))))
-                  (when (string-empty-p (string-trim new))
-                    (user-error "Queue message cannot be empty"))
-                  (emacs-dsh--queue-update item kind new)))
+                     (parts (if (vectorp content) (append content nil) content))
+                     (text (mapconcat (lambda (part)
+                                        (if (equal (alist-get 'type part) "text")
+                                            (or (alist-get 'text part) "") ""))
+                                      parts "\n"))
+                     (images (cl-remove-if-not
+                              (lambda (part) (equal (alist-get 'type part) "image"))
+                              parts))
+                     (new (read-string "Edit queued message: " text))
+                     (kept (cl-loop for image in images for index from 1
+                                    when (y-or-n-p (format "Keep image %d (%s)? " index
+                                                          (or (alist-get 'name image) "image")))
+                                    collect image))
+                     (updated (append (unless (string-empty-p (string-trim new))
+                                        (list `((type . "text") (text . ,new))))
+                                      kept)))
+                (unless updated (user-error "Queue message cannot be empty"))
+                (emacs-dsh--queue-update item kind updated))
             (emacs-dsh--queue-update item kind)))))))
 
 (defun emacs-dsh--close ()
@@ -2335,21 +2500,23 @@ actual creation time.  Read all missing snapshots over one temporary socket."
       (concat "@" path))))
 
 (defun emacs-dsh--local-file-candidates (query)
-  "List QUERY's immediate directory under the local chat root."
+  "List QUERY's immediate directory, including home and absolute paths."
   (when (and (stringp emacs-dsh--root)
              (file-directory-p emacs-dsh--root))
     (let* ((relative (or (file-name-directory query) ""))
            (directory (expand-file-name relative emacs-dsh--root))
+           (external (or (file-name-absolute-p query)
+                         (string-prefix-p "~/" query)))
            (root (file-truename emacs-dsh--root)))
       (when (and (file-directory-p directory)
-                 (file-in-directory-p (file-truename directory) root))
+                 (or external (file-in-directory-p (file-truename directory) root)))
         (delq nil
               (mapcar
                (lambda (name)
                  (let ((path (expand-file-name name directory)))
                    (when (and (not (member name '("." "..")))
                               (string-prefix-p (file-name-nondirectory query) name)
-                              (file-in-directory-p (file-truename path) root))
+                              (or external (file-in-directory-p (file-truename path) root)))
                      (let* ((directory-p (file-directory-p path))
                             (reference (concat relative name
                                                (if directory-p "/" ""))))
@@ -2360,16 +2527,19 @@ actual creation time.  Read all missing snapshots over one temporary socket."
 (defun emacs-dsh--complete-host-file (context)
   "Complete @ from Host files, local files, and cross-session references."
   (let ((query (plist-get context :query)))
-    (emacs-dsh--call
-     "fileReferences/list"
-     `((agentId . ,emacs-dsh--session-id) (query . ,query))
-     (lambda (files)
-       (emacs-dsh--complete-references
-        context (or files (emacs-dsh--local-file-candidates query))))
-     (lambda (failure)
-       (message "emacs-dsh: file candidates unavailable: %s" failure)
-       (emacs-dsh--complete-references
-        context (emacs-dsh--local-file-candidates query))))))
+    (if (or (file-name-absolute-p query) (string-prefix-p "~/" query))
+        (emacs-dsh--show-reference-choices
+         context (emacs-dsh--local-file-candidates query) nil)
+       (emacs-dsh--call
+        "fileReferences/list"
+        `((agentId . ,emacs-dsh--session-id) (query . ,query))
+        (lambda (files)
+          (emacs-dsh--complete-references
+           context (or files (emacs-dsh--local-file-candidates query))))
+        (lambda (failure)
+          (message "emacs-dsh: file candidates unavailable: %s" failure)
+          (emacs-dsh--complete-references
+           context (emacs-dsh--local-file-candidates query)))))))
 
 (defun emacs-dsh--complete-references (context files)
   "Finish @ completion with FILES and Host session candidates."
