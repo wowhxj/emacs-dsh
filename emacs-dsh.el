@@ -8,10 +8,9 @@
 ;; URL: https://github.com/wowhxj/emacs-dsh
 
 ;;; Commentary:
-;; A small, independent client for the *running* DSH Web Host.  It uses the
-;; authenticated Connection HTTP RPC and the Gateway Remote-stream WebSocket;
-;; it does not launch a second Harness runtime or import Pimacs/PI internals.
-;; See README.md for the token-based initial connection and WSL path mapping.
+;; A client for DSH Web Host.  By default Emacs starts its own local Host and
+;; authenticates using its launch URL.  An optional bridge connects to the
+;; already running DSH Desktop Host.  See README.md for both modes.
 
 ;;; Code:
 
@@ -33,10 +32,21 @@
      :background "#29434b" :foreground "#e5f2ef")
     (t :inherit mode-line))
   "Face for the DSH mode-line status." :group 'emacs-dsh)
+(defcustom emacs-dsh-connection-mode 'managed
+  "How Emacs connects to a local DSH Host.
+`managed' starts and owns a `dsh web' process in Emacs's operating system.
+`desktop' uses the separately installed Host bridge to join DSH Desktop."
+  :type '(choice (const :tag "Emacs-managed dsh web" managed)
+                 (const :tag "Existing Desktop Host via bridge" desktop))
+  :group 'emacs-dsh)
+(defcustom emacs-dsh-managed-command "dsh"
+  "Executable used to start the Emacs-managed DSH Web Host.
+Set an absolute path if `dsh' is not on Emacs's PATH."
+  :type 'string :group 'emacs-dsh)
 (defcustom emacs-dsh-url "http://127.0.0.1:19387/"
-  "URL of the existing DSH Web Host, without its launch token.
-Automatic discovery updates this value from the local Host bridge.  Never put
-bearer credentials into version-controlled Emacs configuration."
+  "URL of the current DSH Web Host, without its launch token.
+The selected connection mode updates this after discovering its local Host.
+Never put bearer credentials into version-controlled Emacs configuration."
   :type 'string :group 'emacs-dsh)
 (defcustom emacs-dsh-bridge-file nil
   "Override local Host bridge file path; nil discovers it from DSH_HOME.
@@ -44,8 +54,8 @@ On WSL the Windows user's ~/.dsh file is located via powershell.exe."
   :type '(choice (const nil) file) :group 'emacs-dsh)
 (defcustom emacs-dsh-wsl-path-function nil
   "Optional function converting Emacs paths to paths understood by the DSH Host.
-On WSL, nil defaults to `emacs-dsh-wsl-windows-path'.  Elsewhere nil sends
-paths unchanged."
+In Desktop mode on WSL, nil uses `emacs-dsh-wsl-windows-path'.  In managed mode
+and on macOS, nil sends paths unchanged."
   :type '(choice (const nil) function) :group 'emacs-dsh)
 (defcustom emacs-dsh-max-messages 100
   "Number of messages in the first history snapshot."
@@ -58,9 +68,15 @@ paths unchanged."
   "Creation times learned from Session follow snapshots, keyed by session ID.")
 (defvar emacs-dsh--cookie-jar nil "Session-local Cookie header, never written to a file.")
 (defvar emacs-dsh--authenticated-base nil "Host base associated with the current cookie.")
-(defvar emacs-dsh--authenticated-nonce nil "Host bridge generation for the current cookie.")
+(defvar emacs-dsh--authenticated-nonce nil "Host generation for the current cookie.")
+(defvar emacs-dsh--authenticated-mode nil "Connection mode for the current cookie.")
 (defvar emacs-dsh--auth-waiters nil "Callbacks waiting for automatic authentication.")
 (defvar emacs-dsh--auth-running nil "Non-nil while an authentication attempt is in progress.")
+(defvar emacs-dsh--managed-process nil "DSH Web Host process owned by this Emacs.")
+(defvar emacs-dsh--managed-connection nil "Current managed (base launch nonce) tuple.")
+(defvar emacs-dsh--managed-output "" "Bounded startup output before a launch URL arrives.")
+(defvar emacs-dsh--managed-waiters nil "Callbacks waiting for managed Host startup.")
+(defvar emacs-dsh--managed-timer nil "Startup timeout for the managed Host.")
 (defvar-local emacs-dsh--session-id nil)
 (defvar-local emacs-dsh--root nil)
 (defvar-local emacs-dsh--socket nil)
@@ -132,7 +148,7 @@ buffer that initiated the call, if that buffer is still alive."
                      (error "Connection failed: %s" (or (plist-get status :error)
                                                        "invalid HTTP response")))
                    (unless (= (string-to-number (match-string 1)) 200)
-                     (error "DSH HTTP %s (check local bridge and Host)" (match-string 1)))
+                     (error "DSH HTTP %s (check local Host connection)" (match-string 1)))
                    (unless (re-search-forward "\r?\n\r?\n" nil t)
                      (error "Missing response body"))
                    (let* ((reply (json-parse-buffer :object-type 'alist
@@ -157,7 +173,8 @@ buffer that initiated the call, if that buffer is still alive."
   "Discard the current signed Host cookie."
   (setq emacs-dsh--cookie-jar nil
         emacs-dsh--authenticated-base nil
-        emacs-dsh--authenticated-nonce nil))
+        emacs-dsh--authenticated-nonce nil
+        emacs-dsh--authenticated-mode nil))
 
 (defun emacs-dsh--call-attempt (endpoint args success on-error retry)
   "Call ENDPOINT, retrying once after a stale cookie when RETRY is non-nil."
@@ -257,6 +274,126 @@ buffer that initiated the call, if that buffer is still alive."
         (error "DSH bridge invalid or not from the local Host"))
       (list url token (alist-get 'nonce data)))))
 
+(defun emacs-dsh--managed-parse-launch (output)
+  "Return (base launch) from trusted local DSH startup OUTPUT, or nil."
+  (when (string-match
+         "dsh web:[[:space:]]*\\(http://127\\.0\\.0\\.1:\\([0-9]+\\)/[?]token=[A-Za-z0-9_-]+\\)"
+         output)
+    (let ((port (string-to-number (match-string 2 output)))
+          (launch (match-string 1 output)))
+      (when (<= 1 port 65535)
+        (list (format "http://127.0.0.1:%d/" port) launch)))))
+
+(defun emacs-dsh--managed-notify (connection failure)
+  "Notify all startup waiters with CONNECTION or FAILURE."
+  (let ((waiters (nreverse emacs-dsh--managed-waiters)))
+    (setq emacs-dsh--managed-waiters nil)
+    (dolist (waiter waiters) (funcall waiter connection failure))))
+
+(defun emacs-dsh--managed-filter (process output)
+  "Capture PROCESS's local launch URL from its startup OUTPUT."
+  (when (and (eq process emacs-dsh--managed-process)
+             (not emacs-dsh--managed-connection))
+    (setq emacs-dsh--managed-output
+          (concat emacs-dsh--managed-output output))
+    (if-let* ((launch (emacs-dsh--managed-parse-launch emacs-dsh--managed-output)))
+        (progn
+          (when emacs-dsh--managed-timer
+            (cancel-timer emacs-dsh--managed-timer)
+            (setq emacs-dsh--managed-timer nil))
+          (setq emacs-dsh--managed-output ""
+                emacs-dsh--managed-connection
+                (append launch (list (emacs-dsh--uuid))))
+          (emacs-dsh--managed-notify emacs-dsh--managed-connection nil))
+      (when (> (length emacs-dsh--managed-output) 8192)
+        (setq emacs-dsh--managed-output
+              (substring emacs-dsh--managed-output -8192))))))
+
+(defun emacs-dsh--managed-sentinel (process _event)
+  "Forget PROCESS if the managed Host exits."
+  (when (and (eq process emacs-dsh--managed-process)
+             (not (process-live-p process)))
+    (when emacs-dsh--managed-timer
+      (cancel-timer emacs-dsh--managed-timer)
+      (setq emacs-dsh--managed-timer nil))
+    (setq emacs-dsh--managed-process nil
+          emacs-dsh--managed-connection nil
+          emacs-dsh--managed-output "")
+    (emacs-dsh--invalidate-auth)
+    (emacs-dsh--managed-notify nil
+                               "Emacs-managed DSH Host exited; check dsh web availability")))
+
+(defun emacs-dsh--managed-start (callback)
+  "Call CALLBACK with (connection error), starting a local Host if needed."
+  (cond
+   ((and emacs-dsh--managed-process
+         (process-live-p emacs-dsh--managed-process)
+         emacs-dsh--managed-connection)
+    (funcall callback emacs-dsh--managed-connection nil))
+   (t
+    (push callback emacs-dsh--managed-waiters)
+    (unless (and emacs-dsh--managed-process
+                 (process-live-p emacs-dsh--managed-process))
+      (setq emacs-dsh--managed-process nil
+            emacs-dsh--managed-connection nil
+            emacs-dsh--managed-output "")
+      (condition-case err
+          (let ((program (or (executable-find emacs-dsh-managed-command)
+                             (and (file-executable-p emacs-dsh-managed-command)
+                                  emacs-dsh-managed-command))))
+            (unless program
+              (error "Cannot find dsh executable; set emacs-dsh-managed-command"))
+            (setq emacs-dsh--managed-process
+                  (make-process
+                   :name "emacs-dsh-web" :buffer nil :noquery t
+                   :command (list program "web" "--host" "127.0.0.1"
+                                  "--port" "0" "--no-open")
+                   :coding 'utf-8-unix
+                   :filter #'emacs-dsh--managed-filter
+                   :sentinel #'emacs-dsh--managed-sentinel))
+            (let ((process emacs-dsh--managed-process))
+              (setq emacs-dsh--managed-timer
+                    (run-at-time
+                     45 nil
+                     (lambda ()
+                       (when (and (eq process emacs-dsh--managed-process)
+                                  (not emacs-dsh--managed-connection))
+                         (setq emacs-dsh--managed-process nil
+                               emacs-dsh--managed-output ""
+                               emacs-dsh--managed-timer nil)
+                         (delete-process process)
+                         (emacs-dsh--managed-notify
+                           nil "Timed out starting dsh web; check the CLI configuration")))))))
+        (error
+         (setq emacs-dsh--managed-process nil)
+         (emacs-dsh--managed-notify nil (error-message-string err))))))))
+
+(defun emacs-dsh--managed-stop ()
+  "Stop only the DSH Web Host process owned by this Emacs."
+  (when emacs-dsh--managed-timer
+    (cancel-timer emacs-dsh--managed-timer)
+    (setq emacs-dsh--managed-timer nil))
+  (let ((process emacs-dsh--managed-process))
+    (setq emacs-dsh--managed-process nil
+          emacs-dsh--managed-connection nil
+          emacs-dsh--managed-output "")
+    (when (and process (process-live-p process)) (delete-process process)))
+  (emacs-dsh--invalidate-auth)
+  (emacs-dsh--managed-notify nil "Emacs-managed DSH Host stopped"))
+
+(add-hook 'kill-emacs-hook #'emacs-dsh--managed-stop)
+
+(defun emacs-dsh--connection-launch (callback)
+  "Discover the selected local Host; pass (connection error) to CALLBACK."
+  (pcase emacs-dsh-connection-mode
+    ('managed (emacs-dsh--managed-start callback))
+    ('desktop
+     (let ((result (condition-case err
+                       (list (emacs-dsh--bridge-launch) nil)
+                     (error (list nil (error-message-string err))))))
+       (apply callback result)))
+    (_ (funcall callback nil "Invalid emacs-dsh-connection-mode"))))
+
 (defun emacs-dsh--exchange-token (launch callback)
   "Exchange LAUNCH for a signed cookie; invoke CALLBACK with an error or nil."
   (let* ((url-cookie-file nil)
@@ -296,31 +433,42 @@ buffer that initiated the call, if that buffer is still alive."
     (dolist (waiter waiters) (funcall waiter failure))))
 
 (defun emacs-dsh--ensure-auth (callback)
-  "Authenticate automatically using the local bridge, calling CALLBACK once."
+  "Authenticate automatically to the selected local Host, calling CALLBACK once."
   (let* ((origin (current-buffer))
          (notify (lambda (failure)
                    (when (buffer-live-p origin)
                      (with-current-buffer origin (funcall callback failure)))))
-         (bridge (condition-case err (emacs-dsh--bridge-launch)
-                   (error (cons nil (error-message-string err)))))
-         (base (car bridge)))
-    (cond
-     ((and base emacs-dsh--cookie-jar (equal base emacs-dsh--authenticated-base)
-           (equal (caddr bridge) emacs-dsh--authenticated-nonce))
-      (funcall notify nil))
-     (emacs-dsh--auth-running (push notify emacs-dsh--auth-waiters))
-     ((not base) (funcall notify (cdr bridge)))
-     (t
-      (push notify emacs-dsh--auth-waiters)
-      (unless emacs-dsh--auth-running
-        (setq emacs-dsh--auth-running t emacs-dsh-url base)
-        (emacs-dsh--exchange-token
-         (cadr bridge)
-         (lambda (cookie failure)
-           (setq emacs-dsh--cookie-jar cookie
-                 emacs-dsh--authenticated-base (and cookie base)
-                 emacs-dsh--authenticated-nonce (and cookie (caddr bridge)))
-           (emacs-dsh--auth-finish failure))))))))
+         (mode emacs-dsh-connection-mode))
+    (push notify emacs-dsh--auth-waiters)
+    (unless emacs-dsh--auth-running
+      (setq emacs-dsh--auth-running t)
+      (emacs-dsh--connection-launch
+       (lambda (connection failure)
+         (cond
+          (failure (emacs-dsh--auth-finish failure))
+          ((not (eq mode emacs-dsh-connection-mode))
+           (emacs-dsh--auth-finish "Connection mode changed; retry"))
+          ((and emacs-dsh--cookie-jar
+                (equal (car connection) emacs-dsh--authenticated-base)
+                (equal (caddr connection) emacs-dsh--authenticated-nonce)
+                (eq mode emacs-dsh--authenticated-mode))
+           (emacs-dsh--auth-finish nil))
+          (t
+           (emacs-dsh--invalidate-auth)
+           (setq emacs-dsh-url (car connection))
+           (condition-case err
+               (emacs-dsh--exchange-token
+                (cadr connection)
+                (lambda (cookie error)
+                  (if (and (eq mode 'managed)
+                           (not (equal connection emacs-dsh--managed-connection)))
+                      (emacs-dsh--auth-finish "Emacs-managed DSH Host restarted; retry")
+                    (setq emacs-dsh--cookie-jar cookie
+                          emacs-dsh--authenticated-base (and cookie (car connection))
+                          emacs-dsh--authenticated-nonce (and cookie (caddr connection))
+                          emacs-dsh--authenticated-mode (and cookie mode))
+                    (emacs-dsh--auth-finish error))))
+             (error (emacs-dsh--auth-finish (error-message-string err)))))))))))
 
 ;;;###autoload
 (defun emacs-dsh-connect ()
@@ -345,7 +493,9 @@ buffer that initiated the call, if that buffer is still alive."
 (defun emacs-dsh--host-path (path)
   (cond (emacs-dsh-wsl-path-function
          (funcall emacs-dsh-wsl-path-function path))
-        ((getenv "WSL_DISTRO_NAME") (emacs-dsh-wsl-windows-path path))
+        ((and (eq emacs-dsh-connection-mode 'desktop)
+              (getenv "WSL_DISTRO_NAME"))
+         (emacs-dsh-wsl-windows-path path))
         (t path)))
 
 (defun emacs-dsh--local-path (path)
