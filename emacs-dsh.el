@@ -110,6 +110,7 @@ and on macOS, nil sends paths unchanged."
 (defvar-local emacs-dsh--seen nil)
 (defvar-local emacs-dsh--pending nil)
 (defvar-local emacs-dsh--attachments nil)
+(defvar-local emacs-dsh--attachment-overlay nil)
 (defvar-local emacs-dsh--draft nil)
 (defvar-local emacs-dsh--input-start nil)
 (defvar-local emacs-dsh--stream-overlay nil)
@@ -126,6 +127,19 @@ and on macOS, nil sends paths unchanged."
 (defvar-local emacs-dsh--queue-ready nil)
 (defvar-local emacs-dsh--tool-cards nil)
 (defvar-local emacs-dsh--tool-pending nil)
+(defvar-local emacs-dsh--context-pressure nil)
+(defvar-local emacs-dsh--agent-preset nil)
+(defvar-local emacs-dsh--active-tools nil)
+(defvar-local emacs-dsh--waiting nil)
+(defvar-local emacs-dsh--spinner-timer nil)
+(defvar emacs-dsh--events-socket nil "One host-wide $events connection for all chats.")
+(defvar emacs-dsh--events-client nil)
+(defvar emacs-dsh--events-queue nil)
+(defvar emacs-dsh--events-active nil)
+(defvar emacs-dsh--events-prompting nil)
+(defvar emacs-dsh--events-cancelled nil)
+(defvar emacs-dsh--events-retry nil)
+(defvar-local emacs-dsh--spinner-index 0)
 (defconst emacs-dsh--composer-prefix "\nYou> ")
 
 (defun emacs-dsh--base ()
@@ -606,6 +620,10 @@ An existing but invalid bridge must fail validation, not silently fall back."
   (setq-local emacs-dsh--queue-ready nil)
   (setq-local emacs-dsh--tool-cards (make-hash-table :test #'equal))
   (setq-local emacs-dsh--tool-pending nil)
+  (setq-local emacs-dsh--context-pressure nil)
+  (setq-local emacs-dsh--agent-preset nil)
+  (setq-local emacs-dsh--active-tools nil)
+  (setq-local emacs-dsh--waiting nil)
   (setq-local emacs-dsh--cursor -1)
   (setq-local emacs-dsh--last-prompt nil)
   (setq-local truncate-lines nil)
@@ -614,41 +632,66 @@ An existing but invalid bridge must fail validation, not silently fall back."
   (add-to-invisibility-spec 'emacs-dsh-tool-details)
   (setq-local header-line-format '(:eval (emacs-dsh--header)))
   (tab-line-mode -1)
-  (setq-local mode-line-format
-              '("%e" mode-line-front-space (:eval (emacs-dsh--state))
-                mode-line-end-spaces))
+  (setq-local mode-line-misc-info
+              (cons '(:eval (emacs-dsh--state)) mode-line-misc-info))
   (add-hook 'kill-buffer-hook #'emacs-dsh--close nil t))
 
 (defun emacs-dsh--header ()
-  (when emacs-dsh--last-prompt
-    (let* ((full (concat "user> " (replace-regexp-in-string
-                                   "[\r\n]+" " ↵ " emacs-dsh--last-prompt)))
-           (window (get-buffer-window (current-buffer) t))
-           (width (if window (window-body-width window) 100))
-           (shown (truncate-string-to-width full (max 30 (1- width))
-                                            nil nil "…")))
-      (propertize (replace-regexp-in-string "%" "%%" shown)
-                  'face 'emacs-dsh-user-face
-                  'help-echo full))))
+  "Show context pressure on the left and model configuration on the right."
+  (let* ((pressure emacs-dsh--context-pressure)
+         (tokens (or (alist-get 'projectedTokens pressure)
+                     (alist-get 'pressureTokens pressure)))
+         (window (alist-get 'contextWindow pressure))
+         (selection emacs-dsh--model-selection)
+         (left (if (and (numberp tokens) (numberp window))
+                   (format "%.1fk/%.1fk" (/ tokens 1000.0) (/ window 1000.0))
+                 "context: —"))
+         (right (if selection
+                    (format "(%s) %s • %s%s"
+                            (alist-get 'provider selection)
+                            (alist-get 'model selection)
+                            (or (alist-get 'reasoningEffort selection) "default")
+                            (if emacs-dsh--agent-preset
+                                (format " • %s" emacs-dsh--agent-preset) ""))
+                  "model: loading")))
+    (concat left " " (propertize " " 'display `(space :align-to (- right ,(string-width right))))
+            (replace-regexp-in-string "%" "%%" right))))
+
 (defun emacs-dsh--state ()
-  (let* ((selection emacs-dsh--model-selection)
-         (queued (cl-count 'queued emacs-dsh--queue-items :key #'car))
-         (steering (cl-count 'steering emacs-dsh--queue-items :key #'car))
-         (label (format " DSH [%s] %s%s%s  %s "
-                        (or emacs-dsh--session-id "connecting")
-                        (if emacs-dsh--running "running" "idle")
-                         (concat (if emacs-dsh--attachments
-                                     (format "  [%d image(s)]" (length emacs-dsh--attachments)) "")
-                                 (if (or (> queued 0) (> steering 0))
-                                     (format "  [Q%d S%d]" queued steering) ""))
-                        (if selection
-                            (format "  %s/%s  thinking: %s"
-                                    (alist-get 'provider selection)
-                                    (alist-get 'model selection)
-                                    (or (alist-get 'reasoningEffort selection) "default"))
-                          "  model: loading")
-                        (or emacs-dsh--root ""))))
-    (propertize label 'face 'emacs-dsh-status-face)))
+  "Show the agent's activity in the ordinary Emacs mode line."
+  (let ((queued (cl-count 'queued emacs-dsh--queue-items :key #'car))
+        (steering (cl-count 'steering emacs-dsh--queue-items :key #'car)))
+    (propertize
+     (format " DSH %s%s%s"
+             (cond (emacs-dsh--waiting emacs-dsh--waiting)
+                   (emacs-dsh--active-tools
+                    (format "tool: %s" (car emacs-dsh--active-tools)))
+                   (emacs-dsh--running "thinking")
+                   (t "idle"))
+             (if emacs-dsh--running
+                 (format " %c" (aref "|/-\\" (mod emacs-dsh--spinner-index 4)))
+               "")
+             (if (or (> queued 0) (> steering 0))
+                 (format " [Q%d S%d]" queued steering) ""))
+     'face 'emacs-dsh-status-face)))
+
+(defun emacs-dsh--set-running (running)
+  "Track RUNNING and animate only while a turn is active."
+  (setq emacs-dsh--running running)
+  (if running
+      (unless emacs-dsh--spinner-timer
+        (let ((buffer (current-buffer)))
+          (setq emacs-dsh--spinner-timer
+                (run-at-time 0.15 0.15
+                             (lambda ()
+                               (when (buffer-live-p buffer)
+                                 (with-current-buffer buffer
+                                   (setq emacs-dsh--spinner-index (1+ emacs-dsh--spinner-index))
+                                   (force-mode-line-update))))))))
+    (when emacs-dsh--spinner-timer
+      (cancel-timer emacs-dsh--spinner-timer)
+      (setq emacs-dsh--spinner-timer nil)))
+   (force-mode-line-update))
 
 (defun emacs-dsh--compose ()
   (let ((inhibit-read-only t))
@@ -665,7 +708,9 @@ An existing but invalid bridge must fail validation, not silently fall back."
                                     :value (or draft ""))))
        (widget-setup)
        (set-marker-insertion-type emacs-dsh--input-start t)
-       (goto-char start))))
+       (goto-char start)
+       (when emacs-dsh--attachments
+         (emacs-dsh--update-image-preview)))))
 
 (defun emacs-dsh--input-widget ()
   (and emacs-dsh--draft (widget-get emacs-dsh--draft :from) emacs-dsh--draft))
@@ -890,7 +935,9 @@ Assistant TEXT is rendered as Markdown; USER text is shown literally."
   (let* ((id (or (alist-get 'callId data) (format "event:%s" seq)))
          (name (or (alist-get 'name data) "tool")))
     (push id emacs-dsh--tool-pending)
-    (emacs-dsh--make-tool-card id name (alist-get 'arguments data))))
+    (push name emacs-dsh--active-tools)
+    (emacs-dsh--make-tool-card id name (alist-get 'arguments data))
+    (force-mode-line-update)))
 
 (defun emacs-dsh--tool-result (data)
   "Append tool result DATA to its matching card."
@@ -909,6 +956,9 @@ Assistant TEXT is rendered as Markdown; USER text is shown literally."
       (setq id (or id (format "orphan:%s" (float-time)))
             card (emacs-dsh--make-tool-card id "tool result" nil)))
     (setq emacs-dsh--tool-pending (delete id emacs-dsh--tool-pending))
+    (setq emacs-dsh--active-tools
+          (cl-remove (emacs-dsh--tool-card-name card) emacs-dsh--active-tools
+                     :test #'equal :count 1))
     (let ((inhibit-read-only t)
           (details (emacs-dsh--tool-card-details card)))
       (save-excursion
@@ -928,7 +978,8 @@ Assistant TEXT is rendered as Markdown; USER text is shown literally."
           (set-marker (emacs-dsh--tool-card-end card) (point))
           (move-overlay details (overlay-start details) (point)))))
     (setf (emacs-dsh--tool-card-status card) (if failed 'error 'success))
-    (emacs-dsh--refresh-tool-card card)))
+    (emacs-dsh--refresh-tool-card card)
+    (force-mode-line-update)))
 
 (defun emacs-dsh--content (blocks)
   (mapconcat
@@ -970,11 +1021,13 @@ Assistant TEXT is rendered as Markdown; USER text is shown literally."
            (unless (string-empty-p text)
               (emacs-dsh--insert-message "DSH: " text))))
         ("tool/call"
-         (emacs-dsh--tool-call data seq))
+          (emacs-dsh--tool-call data seq))
         ("tool/result"
-         (emacs-dsh--tool-result data))
+          (emacs-dsh--tool-result data))
         ("model/selection"
          (setq emacs-dsh--model-selection data))
+        ("agent-preset/selected"
+         (setq emacs-dsh--agent-preset (alist-get 'agentPreset data)))
         ("request/header"
          (let* ((header (alist-get 'header data))
                 (config (alist-get 'config header))
@@ -989,8 +1042,9 @@ Assistant TEXT is rendered as Markdown; USER text is shown literally."
                                       (not (alist-get 'reasoningEffort
                                                      (alist-get 'adapterDefaults header))))
                              `((reasoningEffort . ,(format "%s" effort)))))))))
-        ("turn/start" (setq emacs-dsh--running t))
-        ("turn/end" (setq emacs-dsh--running nil)
+        ("turn/start" (emacs-dsh--set-running t))
+        ("turn/end" (setq emacs-dsh--active-tools nil emacs-dsh--waiting nil)
+         (emacs-dsh--set-running nil)
          (let* ((reason (alist-get 'reason data))
                 (failure (alist-get 'error reason)))
            (emacs-dsh--insert-before-input
@@ -1049,20 +1103,28 @@ Assistant TEXT is rendered as Markdown; USER text is shown literally."
             (entry (cl-loop for (id . cell) in projections
                             when (equal (if (symbolp id) (symbol-name id) id)
                                         emacs-dsh--session-id)
-                            return cell)))
-       (emacs-dsh--set-inbox (alist-get 'inbox (alist-get 'values entry))
-                             (or (alist-get 'asOfSeq entry) -1))))
+                            return cell))
+            (values (alist-get 'values entry)))
+       (emacs-dsh--set-inbox (alist-get 'inbox values)
+                             (or (alist-get 'asOfSeq entry) -1))
+       (setq emacs-dsh--context-pressure (alist-get 'contextPressure values)
+             emacs-dsh--agent-preset (alist-get 'agentPreset values))
+       (force-mode-line-update)))
     ("projection"
-     (when (and (equal (alist-get 'sessionId value) emacs-dsh--session-id)
-                (equal (alist-get 'key value) "inbox"))
-       (emacs-dsh--set-inbox (alist-get 'value value)
-                             (alist-get 'seq value))))))
+     (when (equal (alist-get 'sessionId value) emacs-dsh--session-id)
+       (pcase (alist-get 'key value)
+         ("inbox" (emacs-dsh--set-inbox (alist-get 'value value)
+                                         (alist-get 'seq value)))
+         ("contextPressure"
+          (setq emacs-dsh--context-pressure (alist-get 'value value))
+          (force-mode-line-update))
+         ("agentPreset"
+          (setq emacs-dsh--agent-preset (alist-get 'value value))
+          (force-mode-line-update)))))))
 
 (defun emacs-dsh--control-payload ()
   "Return a session/control subscription frame."
-  (json-serialize `((type . "open") (streamId . ,(concat "control:" emacs-dsh--session-id))
-                    (endpoint . "session/control")
-                    (payload . ((args . ,(make-hash-table)))))))
+  (emacs-dsh--stream-open "dsh-control" "session/control"))
 
 (defun emacs-dsh--on-frame (buffer socket frame)
   (when (buffer-live-p buffer)
@@ -1072,14 +1134,13 @@ Assistant TEXT is rendered as Markdown; USER text is shown literally."
             (let ((data (json-parse-string (websocket-frame-payload frame)
                                            :object-type 'alist :array-type 'list
                                            :null-object nil :false-object nil)))
-               (cond
-                ((equal (alist-get 'streamId data)
-                        (concat "control:" emacs-dsh--session-id))
-                 (pcase (alist-get 'type data)
-                   ("item" (emacs-dsh--control-item (alist-get 'value data)))
-                   ("error" (message "emacs-dsh control: %s"
-                                     (alist-get 'message (alist-get 'error data))))))
-                ((equal (alist-get 'streamId data) emacs-dsh--session-id)
+              (cond
+               ((equal (alist-get 'streamId data) "dsh-control")
+                (pcase (alist-get 'type data)
+                  ("item" (emacs-dsh--control-item (alist-get 'value data)))
+                  ("error" (message "emacs-dsh control: %s"
+                                    (alist-get 'message (alist-get 'error data))))))
+               ((equal (alist-get 'streamId data) emacs-dsh--session-id)
                 (pcase (alist-get 'type data)
                   ("item"
                    (let ((value (alist-get 'value data)))
@@ -1092,20 +1153,233 @@ Assistant TEXT is rendered as Markdown; USER text is shown literally."
                           (clrhash emacs-dsh--seen))
                         (dolist (record (alist-get 'records value))
                           (emacs-dsh--event (alist-get 'event record)))
-                        ;; The snapshot projection is newer than its history page.
-                        (when-let* ((selection
-                                     (alist-get 'next
-                                                (alist-get 'modelSelection
-                                                           (alist-get 'values
-                                                                      (alist-get 'projections value))))))
-                          (setq emacs-dsh--model-selection selection))
+                        (let ((values (alist-get 'values (alist-get 'projections value))))
+                          (when-let* ((selection (alist-get 'next
+                                                             (alist-get 'modelSelection values))))
+                            (setq emacs-dsh--model-selection selection))
+                          (setq emacs-dsh--context-pressure
+                                (alist-get 'contextPressure values)
+                                emacs-dsh--agent-preset
+                                (or (alist-get 'agentPreset values)
+                                    (alist-get 'agentPreset (alist-get 'header value)))))
                         (setq emacs-dsh--cursor (max emacs-dsh--cursor
                                                      (or (alist-get 'cursor value) -1))))
                        ("event" (emacs-dsh--event (alist-get 'event value)))
                        ("assistant-stream" (emacs-dsh--stream (alist-get 'frame value))))))
-                   ("error" (message "emacs-dsh stream: %s"
-                                      (alist-get 'message (alist-get 'error data))))))))
+                  ("error" (message "emacs-dsh stream: %s"
+                                    (alist-get 'message (alist-get 'error data))))))))
           (error (message "emacs-dsh frame: %s" (error-message-string err))))))))
+
+(defun emacs-dsh--stream-open (stream-id endpoint)
+  "Open one no-argument remote stream on the multiplexed socket."
+  (json-serialize `((type . "open") (streamId . ,stream-id)
+                    (endpoint . ,endpoint)
+                    (payload . ((args . ,(make-hash-table)))))))
+
+(defun emacs-dsh--events-result (entry outcome)
+  "Reply to waterfall ENTRY using OUTCOME on its original generation."
+  (when (and (equal (nth 0 entry) emacs-dsh--events-client)
+             (not (member (nth 1 entry) emacs-dsh--events-cancelled)))
+    (let ((chat (gethash (nth 2 entry) emacs-dsh--chats)))
+      (with-current-buffer (if (buffer-live-p chat) chat (current-buffer))
+        (emacs-dsh--call
+         "$events/result"
+         `((clientId . ,(nth 0 entry)) (eventId . ,(nth 1 entry))
+           (outcome . ,outcome))
+         (lambda (_value) nil)
+         (lambda (error) (message "emacs-dsh: interaction reply failed: %s" error)))))))
+
+(defun emacs-dsh--question-answer (question)
+  "Read one QUESTION and return its wire answer.  Empty input skips it."
+  (let* ((id (alist-get 'id question))
+         (options (alist-get 'options question))
+         (labels (mapcar (lambda (option) (alist-get 'label option)) options))
+         (multi (alist-get 'multiSelect question))
+         (prompt (format "%s%s%s: " (or (alist-get 'question question) "Question")
+                         (if-let* ((detail (alist-get 'detail question)))
+                             (format " — %s" detail) "")
+                         (if multi " (comma-separated; empty skips)" " (empty skips)")))
+         (completion-extra-properties
+          `(:annotation-function
+            ,(lambda (candidate)
+               (when-let* ((option (cl-find candidate options
+                                            :key (lambda (o) (alist-get 'label o))
+                                            :test #'equal))
+                           (description (alist-get 'description option)))
+                 (concat "  " description)))))
+         (raw (if multi (completing-read-multiple prompt labels nil nil)
+                (list (completing-read prompt labels nil nil))))
+         (answers (cl-remove-if #'string-empty-p
+                                (mapcar #'string-trim raw)))
+         (selected (cl-remove-if-not (lambda (answer) (member answer labels)) answers))
+         (custom (string-join
+                  (cl-remove-if (lambda (answer) (member answer labels)) answers) ", ")))
+    (append `((id . ,id) (selected . ,(vconcat selected)))
+            (unless (string-empty-p custom) `((custom . ,custom))))))
+
+(defun emacs-dsh--events-answer (entry)
+  "Prompt for one queued ENTRY, then reply to its host waterfall."
+  (let ((event (nth 3 entry)) (request (nth 4 entry))
+        (emacs-dsh--events-prompting entry))
+    (condition-case err
+        (pcase event
+          ("approval/request"
+           (let ((choice (completing-read
+                          (format "Allow %s%s? "
+                                  (or (alist-get 'toolName request) "tool")
+                                  (if-let* ((reason (alist-get 'reason request)))
+                                      (format " (%s)" reason) ""))
+                          '("Deny" "Allow once") nil t)))
+             (emacs-dsh--events-result
+              entry `((kind . "result")
+                      (value . ,(if (equal choice "Allow once")
+                                    "allowed-once" "rejected"))))))
+          ("user-questions/request"
+           (let ((answers (mapcar #'emacs-dsh--question-answer
+                                  (alist-get 'questions request))))
+             (emacs-dsh--events-result
+              entry `((kind . "result") (value . ((answers . ,(vconcat answers)))))))))
+      (quit
+       (emacs-dsh--events-result
+        entry (if (equal event "approval/request")
+                  '((kind . "next"))
+                '((kind . "rejected")
+                  (error . ((name . "cancelled")
+                            (message . "User abandoned the questions")))))))
+      (error
+       (message "emacs-dsh: interaction failed: %s" (error-message-string err))
+       (emacs-dsh--events-result entry '((kind . "next")))))
+  (when-let* ((chat (gethash (nth 2 entry) emacs-dsh--chats))
+              ((buffer-live-p chat)))
+    (with-current-buffer chat
+      (setq emacs-dsh--waiting nil)
+      (force-mode-line-update)))))
+
+(defun emacs-dsh--events-drain ()
+  "Serialize host questions and approvals in Emacs' single minibuffer."
+  (if (active-minibuffer-window)
+      (when (and emacs-dsh--events-queue (not emacs-dsh--events-active))
+        (run-at-time 0.2 nil #'emacs-dsh--events-drain))
+    (unless emacs-dsh--events-active
+      (while (and emacs-dsh--events-queue (not (active-minibuffer-window)))
+        (let ((entry (pop emacs-dsh--events-queue)))
+          (unless (member (nth 1 entry) emacs-dsh--events-cancelled)
+            (setq emacs-dsh--events-active entry)
+            (unwind-protect
+                (if (buffer-live-p (gethash (nth 2 entry) emacs-dsh--chats))
+                    (emacs-dsh--events-answer entry)
+                  (emacs-dsh--events-result entry '((kind . "next"))))
+              (setq emacs-dsh--events-active nil))))))))
+
+(defun emacs-dsh--events-frame (socket frame)
+  "Handle a host-wide $events FRAME from SOCKET."
+  (when (eq socket emacs-dsh--events-socket)
+    (condition-case err
+        (let* ((message (json-parse-string (websocket-frame-payload frame)
+                                           :object-type 'alist :array-type 'list))
+               (value (alist-get 'value message))
+               (event-id (alist-get 'eventId value)))
+          (when (equal (alist-get 'type message) "item")
+            (pcase (alist-get 'type value)
+              ("ready" (setq emacs-dsh--events-client (alist-get 'clientId value)
+                              emacs-dsh--events-queue nil
+                              emacs-dsh--events-cancelled nil))
+              ("cancel"
+               (push event-id emacs-dsh--events-cancelled)
+               (let* ((entry (or (and (equal event-id (nth 1 emacs-dsh--events-active))
+                                      emacs-dsh--events-active)
+                                 (cl-find event-id emacs-dsh--events-queue
+                                          :key #'cadr :test #'equal)))
+                      (chat (and entry (gethash (nth 2 entry) emacs-dsh--chats))))
+                 (when (buffer-live-p chat)
+                   (with-current-buffer chat
+                     (setq emacs-dsh--waiting nil)
+                     (force-mode-line-update))))
+               (setq emacs-dsh--events-queue
+                     (cl-remove-if (lambda (entry) (equal event-id (nth 1 entry)))
+                                   emacs-dsh--events-queue))
+               (when (and (equal event-id (nth 1 emacs-dsh--events-prompting))
+                          (active-minibuffer-window))
+                 (abort-recursive-edit)))
+              ("waterfall"
+               (when (and emacs-dsh--events-client event-id
+                          (member (alist-get 'event value)
+                                  '("approval/request" "user-questions/request")))
+                 (let ((entry (list emacs-dsh--events-client event-id
+                                    (alist-get 'agentId value)
+                                    (alist-get 'event value)
+                                    (alist-get 'request value))))
+                   (unless (or (equal event-id (nth 1 emacs-dsh--events-active))
+                               (cl-find event-id emacs-dsh--events-queue
+                                        :key #'cadr :test #'equal))
+                     (setq emacs-dsh--events-queue
+                           (nconc emacs-dsh--events-queue (list entry)))
+                     (when-let* ((chat (gethash (nth 2 entry) emacs-dsh--chats))
+                                 ((buffer-live-p chat)))
+                       (with-current-buffer chat
+                         (setq emacs-dsh--waiting
+                               (if (equal (nth 3 entry) "approval/request")
+                                   "approval needed" "answer needed"))
+                         (force-mode-line-update)))
+                     (run-at-time 0 nil #'emacs-dsh--events-drain))))))))
+      (error (message "emacs-dsh: host interaction frame: %s"
+                      (error-message-string err))))))
+
+(defun emacs-dsh--events-connect ()
+  "Keep one $events socket subscribed for all open chat buffers."
+  (when (and emacs-dsh--cookie-jar (not emacs-dsh--events-socket))
+    (when emacs-dsh--events-retry
+      (cancel-timer emacs-dsh--events-retry)
+      (setq emacs-dsh--events-retry nil))
+    (let* ((base (emacs-dsh--base))
+           (socket-url (concat (if (string-prefix-p "https:" base) "wss" "ws")
+                               (substring base (if (string-prefix-p "https:" base) 5 4))
+                               "api/remote.mux")))
+      (condition-case err
+          (setq emacs-dsh--events-socket
+                (websocket-open
+                 socket-url
+                 :custom-header-alist `(("Cookie" . ,emacs-dsh--cookie-jar))
+                 :on-open (lambda (ws)
+                            (when (eq ws emacs-dsh--events-socket)
+                              (websocket-send-text
+                               ws (emacs-dsh--stream-open "dsh-events" "$events"))))
+                 :on-message #'emacs-dsh--events-frame
+                 :on-close (lambda (ws)
+                             (when (eq ws emacs-dsh--events-socket)
+                               (setq emacs-dsh--events-socket nil
+                                     emacs-dsh--events-client nil
+                                     emacs-dsh--events-queue nil)
+                               (maphash (lambda (_id chat)
+                                          (when (buffer-live-p chat)
+                                            (with-current-buffer chat
+                                              (setq emacs-dsh--waiting nil)
+                                              (force-mode-line-update))))
+                                        emacs-dsh--chats)
+                               (when (and emacs-dsh--events-prompting
+                                          (active-minibuffer-window))
+                                 (abort-recursive-edit))
+                               (when (> (hash-table-count emacs-dsh--chats) 0)
+                                 (setq emacs-dsh--events-retry
+                                       (run-at-time 3 nil #'emacs-dsh--events-reconnect)))))
+                 :on-error (lambda (_ws _phase error)
+                             (message "emacs-dsh $events: %s" error))))
+        (error
+         (message "emacs-dsh $events: %s" (error-message-string err))
+         (when (> (hash-table-count emacs-dsh--chats) 0)
+           (setq emacs-dsh--events-retry
+                 (run-at-time 3 nil #'emacs-dsh--events-reconnect))))))))
+
+(defun emacs-dsh--events-reconnect ()
+  "Reauthenticate before reopening the host interaction stream."
+  (setq emacs-dsh--events-retry nil)
+  (when (> (hash-table-count emacs-dsh--chats) 0)
+    (emacs-dsh--ensure-auth
+     (lambda (failure)
+       (if failure
+           (setq emacs-dsh--events-retry
+                 (run-at-time 3 nil #'emacs-dsh--events-reconnect))
+         (emacs-dsh--events-connect))))))
 
 (defun emacs-dsh--follow-payload (&optional session-id max-messages)
   "Return a Remote follow frame for SESSION-ID or the current chat.
@@ -1151,9 +1425,9 @@ MAX-MESSAGES limits history included in the first snapshot."
                  (lambda (ws)
                    (when (buffer-live-p buffer)
                      (with-current-buffer buffer
-                       (when (eq ws emacs-dsh--socket)
-                          (websocket-send-text ws (emacs-dsh--follow-payload))
-                          (websocket-send-text ws (emacs-dsh--control-payload))))))
+                        (when (eq ws emacs-dsh--socket)
+                           (websocket-send-text ws (emacs-dsh--follow-payload))
+                           (websocket-send-text ws (emacs-dsh--control-payload))))))
                  :on-message
                  (lambda (ws frame) (emacs-dsh--on-frame buffer ws frame))
                  :on-error
@@ -1219,7 +1493,10 @@ MAX-MESSAGES limits history included in the first snapshot."
          (existing (gethash id emacs-dsh--chats)))
     (if (buffer-live-p existing)
         (switch-to-buffer existing)
-      (let ((buffer (generate-new-buffer (format "*emacs-dsh:%s*" id))))
+      (let* ((directory (file-name-nondirectory (directory-file-name root)))
+             (buffer (generate-new-buffer
+                      (format "*emacs-dsh:%s*"
+                              (if (string-empty-p directory) "/" directory)))))
         (puthash id buffer emacs-dsh--chats)
         (switch-to-buffer buffer)
         (emacs-dsh-chat-mode)
@@ -1228,16 +1505,77 @@ MAX-MESSAGES limits history included in the first snapshot."
         (setq-local emacs-dsh--session-id id)
         (emacs-dsh--compose)
         (emacs-dsh--follow)
+        (emacs-dsh--events-connect)
         (emacs-dsh--refresh-model-selection)))))
 
-;;;###autoload
-(defun emacs-dsh-chat (&optional root)
-  "Choose ROOT and create a fresh DSH Session, even when ROOT is already open."
-  (interactive (list (read-directory-name "DSH root: " (emacs-dsh--project-root) nil t)))
-  (setq root (file-name-as-directory (expand-file-name (or root (emacs-dsh--project-root)))))
+(defconst emacs-dsh--preset-names
+  '(("standard" . "Standard") ("code" . "PTC")
+    ("minimal" . "Minimal") ("cordis" . "Creator")))
+
+(defun emacs-dsh--preset-choices (roster)
+  "Return selectable display names and ids from the Host ROSTER."
+  (delq nil (mapcar (lambda (row)
+                      (unless (alist-get 'broken row)
+                        (let ((id (alist-get 'id row)))
+                          (cons (format "%s (%s)" (or (alist-get 'name row)
+                                                       (cdr (assoc id emacs-dsh--preset-names))
+                                                       id) id) id))))
+                    (alist-get 'presets roster))))
+
+(defun emacs-dsh--pick-preset (callback)
+  "Ask for a Host-advertised preset, then call CALLBACK with its id."
   (emacs-dsh--call
-   "session/create" `((request . ((cwd . ,(emacs-dsh--host-path root)))))
+   "agentPresets/list" (make-hash-table)
+   (lambda (roster)
+     (let ((choices (emacs-dsh--preset-choices roster)))
+       (if (null choices)
+           (message "emacs-dsh: no selectable modes")
+         (emacs-dsh--defer-picker
+          (lambda ()
+            (let ((choice (condition-case nil
+                              (completing-read "DSH mode: " choices nil t)
+                            (quit nil))))
+              (when (and choice (not (string-empty-p choice)))
+                (funcall callback (cdr (assoc choice choices))))))))))
+   (lambda (failure) (message "emacs-dsh: modes unavailable: %s" failure))))
+
+;;;###autoload
+(defun emacs-dsh-chat (&optional root choose-mode)
+  "Create a DSH Session in ROOT; with prefix CHOOSE-MODE select its preset."
+  (interactive (list (read-directory-name "DSH root: " (emacs-dsh--project-root) nil t)
+                     current-prefix-arg))
+  (setq root (file-name-as-directory (expand-file-name (or root (emacs-dsh--project-root)))))
+  (if choose-mode
+      (emacs-dsh--pick-preset
+       (lambda (preset) (emacs-dsh--create-session root preset)))
+    (emacs-dsh--create-session root nil)))
+
+(defun emacs-dsh--create-session (root preset)
+  "Create a session in ROOT with optional PRESET."
+  (emacs-dsh--call
+   "session/create"
+   `((request . ,(append `((cwd . ,(emacs-dsh--host-path root)))
+                          (when preset `((agentPreset . ,preset))))))
    (lambda (value) (emacs-dsh--show (alist-get 'sessionId value) root))))
+
+;;;###autoload
+(defun emacs-dsh-select-mode ()
+  "Select a DSH agent preset for the current blank session."
+  (interactive)
+  (unless emacs-dsh--session-id (user-error "Not in a DSH chat"))
+  (emacs-dsh--pick-preset
+   (lambda (preset)
+     (emacs-dsh--call
+      "agentPresets/select" `((agentId . ,emacs-dsh--session-id)
+                              (agentPreset . ,preset))
+      (lambda (_value)
+        (setq emacs-dsh--agent-preset preset emacs-dsh--command-inflight nil)
+        (when (string-prefix-p "/mode" (emacs-dsh--draft-text))
+          (emacs-dsh--replace-draft ""))
+        (force-mode-line-update))
+      (lambda (failure)
+        (setq emacs-dsh--command-inflight nil)
+        (message "emacs-dsh: mode selection failed (only blank sessions): %s" failure))))))
 
 ;;;###autoload
 (defun emacs-dsh-resume ()
@@ -1248,8 +1586,7 @@ MAX-MESSAGES limits history included in the first snapshot."
    (lambda (value)
      (let ((items (alist-get 'items value)))
        (if items
-           (emacs-dsh--session-creation-times
-            items (lambda () (emacs-dsh--resume-picker items)))
+           (emacs-dsh--resume-picker items)
          (message "emacs-dsh: no sessions"))))))
 
 (defun emacs-dsh--session-creation-times (items callback)
@@ -1324,27 +1661,49 @@ actual creation time.  Read all missing snapshots over one temporary socket."
                             (error-message-string err))
                    (finish))))))))
 
+(defun emacs-dsh--workspace-label (item)
+  "Return ITEM's working directory as a readable workspace label."
+  (let ((path (emacs-dsh--local-path (alist-get 'cwd item))))
+    (if (and (stringp path) (not (string-empty-p path)))
+        (abbreviate-file-name (directory-file-name path))
+      "(unknown)")))
+
 (defun emacs-dsh--resume-picker (items)
-  "Show a three-column session picker for ITEMS."
+  "Show all visible sessions with aligned time, ID, workspace, and preview."
   (let* ((id-width (apply #'max (mapcar (lambda (item)
                                          (string-width (alist-get 'sessionId item)))
                                        items)))
+         (workspace-width (apply #'max (mapcar (lambda (item)
+                                                (string-width (emacs-dsh--workspace-label item)))
+                                              items)))
          (choices (mapcar (lambda (item)
-                            (cons (emacs-dsh--session-choice-label item id-width)
+                            (cons (emacs-dsh--session-choice-label
+                                   item id-width workspace-width)
                                   item))
                           items)))
     (emacs-dsh--defer-picker
      (lambda ()
        (when-let* ((choice (cdr (assoc
                                   (completing-read
-                                   "Resume DSH (created | session ID | first prompt): "
+                                   "Resume DSH (time | session ID | workspace | prompt): "
                                    choices nil t)
                                   choices))))
-         (emacs-dsh--show (alist-get 'sessionId choice)
-                          (or (alist-get 'cwd choice) default-directory)))))))
+         (let ((source (current-buffer))
+               (id (alist-get 'sessionId choice)))
+           (when (or (not (derived-mode-p 'emacs-dsh-chat-mode))
+                     (equal id emacs-dsh--session-id)
+                     (and (string-empty-p (emacs-dsh--draft-text))
+                          (null emacs-dsh--attachments))
+                     (yes-or-no-p "Discard unsent DSH draft and switch sessions? "))
+             (emacs-dsh--show id (or (alist-get 'cwd choice) default-directory))
+             (when (and (buffer-live-p source)
+                        (not (eq source (current-buffer))))
+               (with-current-buffer source
+                 (when (derived-mode-p 'emacs-dsh-chat-mode)
+                   (kill-buffer source)))))))))))
 
-(defun emacs-dsh--session-choice-label (item &optional id-width)
-  "Format ITEM as aligned creation time, ID, and first prompt columns."
+(defun emacs-dsh--session-choice-label (item &optional id-width workspace-width)
+  "Format ITEM as aligned time, ID, workspace, and first prompt columns."
   (let* ((values (alist-get 'values (alist-get 'projections item)))
          (outline (alist-get 'turnOutline values))
          (first-prompt (and outline (alist-get 'prompt (car outline))))
@@ -1355,8 +1714,10 @@ actual creation time.  Read all missing snapshots over one temporary socket."
                         (t "(empty session)")))
          (clean (replace-regexp-in-string "[[:space:]\n\r]+" " " preview))
          (id (alist-get 'sessionId item))
+         (workspace (emacs-dsh--workspace-label item))
          (created (or (gethash id emacs-dsh--created-at)
-                      (alist-get 'createdAt item)))
+                      (alist-get 'createdAt item)
+                      (alist-get 'updatedAt item)))
          (date (if (numberp created)
                    (format-time-string "%Y-%m-%d %H:%M"
                                        (seconds-to-time (/ created 1000.0)))
@@ -1364,6 +1725,9 @@ actual creation time.  Read all missing snapshots over one temporary socket."
     (concat (format "%-16s  " date)
             id (make-string (max 0 (- (or id-width (string-width id))
                                       (string-width id))) ?\s)
+            "  " workspace
+            (make-string (max 0 (- (or workspace-width (string-width workspace))
+                                   (string-width workspace))) ?\s)
             "  " (truncate-string-to-width clean 76 nil nil "…"))))
 
 (defun emacs-dsh--model-candidates (catalog)
@@ -1519,6 +1883,7 @@ actual creation time.  Read all missing snapshots over one temporary socket."
     (when (zerop (length content)) (user-error "Write a prompt or attach an image first"))
     (puthash id (cons text images) emacs-dsh--pending)
     (setq emacs-dsh--attachments nil)
+    (emacs-dsh--update-image-preview)
     (emacs-dsh--replace-draft "")
     (force-mode-line-update)
     (emacs-dsh--call
@@ -1533,6 +1898,7 @@ actual creation time.  Read all missing snapshots over one temporary socket."
      (lambda (failure)
        (remhash id emacs-dsh--pending)
        (setq emacs-dsh--attachments (append images emacs-dsh--attachments))
+       (emacs-dsh--update-image-preview)
        (emacs-dsh--replace-draft
         (concat text (unless (string-empty-p (emacs-dsh--draft-text))
                        (concat "\n" (emacs-dsh--draft-text)))))
@@ -1657,7 +2023,8 @@ actual creation time.  Read all missing snapshots over one temporary socket."
                                                0 (min (length images)
                                                       (length emacs-dsh--attachments))))
                    (setq emacs-dsh--attachments
-                         (nthcdr (length images) emacs-dsh--attachments)))
+                         (nthcdr (length images) emacs-dsh--attachments))
+                   (emacs-dsh--update-image-preview))
                  (force-mode-line-update)
                  (emacs-dsh--insert-before-input
                   (format "[command %s] %s" draft (or output "done")) 'shadow)
@@ -1681,7 +2048,7 @@ actual creation time.  Read all missing snapshots over one temporary socket."
      (when (equal draft (emacs-dsh--draft-text))
        (emacs-dsh--replace-draft ""))
      (emacs-dsh--insert-before-input
-      (concat "Commands: /model, /reasoning, /new, /resume, /queue, /file, /status, /help; Host: "
+       (concat "Commands: /model, /reasoning, /mode, /new, /resume, /queue, /file, /status, /help; Host: "
               (mapconcat (lambda (command)
                            (concat "/" (alist-get 'name command)))
                          commands ", ")
@@ -1709,6 +2076,11 @@ actual creation time.  Read all missing snapshots over one temporary socket."
           (progn (setq emacs-dsh--command-inflight nil)
                  (user-error "Send or remove staged images before /reasoning"))
         (emacs-dsh--reasoning-command draft)))
+     ((equal name "mode")
+      (if emacs-dsh--attachments
+          (progn (setq emacs-dsh--command-inflight nil)
+                 (user-error "Send staged images before /mode"))
+        (emacs-dsh-select-mode)))
      ((equal name "new")
       (setq emacs-dsh--command-inflight nil)
       (emacs-dsh--replace-draft "")
@@ -1817,6 +2189,7 @@ actual creation time.  Read all missing snapshots over one temporary socket."
 
 (defun emacs-dsh--close ()
   (setq emacs-dsh--closing t)
+  (emacs-dsh--set-running nil)
   (when emacs-dsh--retry-timer (cancel-timer emacs-dsh--retry-timer)
         (setq emacs-dsh--retry-timer nil))
   (when emacs-dsh--socket (websocket-close emacs-dsh--socket)
@@ -1824,7 +2197,16 @@ actual creation time.  Read all missing snapshots over one temporary socket."
   (when emacs-dsh--stream-overlay
     (delete-overlay emacs-dsh--stream-overlay)
     (setq emacs-dsh--stream-overlay nil))
-  (when emacs-dsh--session-id (remhash emacs-dsh--session-id emacs-dsh--chats)))
+  (when emacs-dsh--session-id (remhash emacs-dsh--session-id emacs-dsh--chats))
+  (when (= (hash-table-count emacs-dsh--chats) 0)
+    (when emacs-dsh--events-retry
+      (cancel-timer emacs-dsh--events-retry)
+      (setq emacs-dsh--events-retry nil))
+    (when emacs-dsh--events-socket
+      (let ((socket emacs-dsh--events-socket))
+        (setq emacs-dsh--events-socket nil emacs-dsh--events-client nil
+              emacs-dsh--events-queue nil)
+        (websocket-close socket)))))
 ;;;###autoload
 (defun emacs-dsh-quit ()
   "Close this chat buffer without deleting its DSH Session."
@@ -1871,17 +2253,42 @@ actual creation time.  Read all missing snapshots over one temporary socket."
         (concat "@\"" path (unless (string-suffix-p "/" path) "\""))
       (concat "@" path))))
 
+(defun emacs-dsh--local-file-candidates (query)
+  "List QUERY's immediate directory under the local chat root."
+  (when (and (stringp emacs-dsh--root)
+             (file-directory-p emacs-dsh--root))
+    (let* ((relative (or (file-name-directory query) ""))
+           (directory (expand-file-name relative emacs-dsh--root))
+           (root (file-truename emacs-dsh--root)))
+      (when (and (file-directory-p directory)
+                 (file-in-directory-p (file-truename directory) root))
+        (delq nil
+              (mapcar
+               (lambda (name)
+                 (let ((path (expand-file-name name directory)))
+                   (when (and (not (member name '("." "..")))
+                              (string-prefix-p (file-name-nondirectory query) name)
+                              (file-in-directory-p (file-truename path) root))
+                     (let* ((directory-p (file-directory-p path))
+                            (reference (concat relative name
+                                               (if directory-p "/" ""))))
+                       `((path . ,reference)
+                         (kind . ,(if directory-p "directory" "file")))))))
+               (directory-files directory)))))))
+
 (defun emacs-dsh--complete-host-file (context)
-  "Complete an @ mention from Host files and cross-session references."
+  "Complete @ from Host files, local files, and cross-session references."
   (let ((query (plist-get context :query)))
     (emacs-dsh--call
      "fileReferences/list"
      `((agentId . ,emacs-dsh--session-id) (query . ,query))
      (lambda (files)
-       (emacs-dsh--complete-references context files))
+       (emacs-dsh--complete-references
+        context (or files (emacs-dsh--local-file-candidates query))))
      (lambda (failure)
        (message "emacs-dsh: file candidates unavailable: %s" failure)
-       (emacs-dsh--complete-references context nil)))))
+       (emacs-dsh--complete-references
+        context (emacs-dsh--local-file-candidates query))))))
 
 (defun emacs-dsh--complete-references (context files)
   "Finish @ completion with FILES and Host session candidates."
@@ -1889,11 +2296,11 @@ actual creation time.  Read all missing snapshots over one temporary socket."
    "sessionReferenceResolver/candidates"
    `((agentId . ,emacs-dsh--session-id)
      (query . ,(plist-get context :query)))
-   (lambda (sessions)
-     (emacs-dsh--show-reference-choices context files sessions))
-   (lambda (failure)
-     (message "emacs-dsh: session candidates unavailable: %s" failure)
-     (emacs-dsh--show-reference-choices context files nil))))
+    (lambda (sessions)
+      (emacs-dsh--show-reference-choices context files sessions))
+    (lambda (failure)
+      (message "emacs-dsh: session candidates unavailable: %s" failure)
+      (emacs-dsh--show-reference-choices context files nil))))
 
 (defun emacs-dsh--show-reference-choices (context files sessions)
   "Offer FILES and SESSIONS, inserting the Host's canonical mention."
@@ -1931,6 +2338,7 @@ actual creation time.  Read all missing snapshots over one temporary socket."
   '(("model" . "Select model") ("reasoning" . "Select thinking effort")
      ("new" . "Start a new session") ("resume" . "Resume a session")
      ("queue" . "Manage queued messages")
+     ("mode" . "Select mode in a blank session")
     ("file" . "Insert a file reference") ("status" . "Show session status")
     ("help" . "List commands"))
   "Commands implemented by the Emacs client rather than the Host registry.")
@@ -2112,6 +2520,68 @@ actual creation time.  Read all missing snapshots over one temporary socket."
                   (when (file-exists-p source) (delete-file source))
                   (when (file-exists-p target) (delete-file target)))))))))))
 
+(defvar emacs-dsh--image-remove-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-1] #'emacs-dsh-remove-image)
+    map)
+  "Mouse map for removing a staged image from its preview.")
+
+(defun emacs-dsh--update-image-preview ()
+  "Show staged image thumbnails above the composer, with remove controls."
+  (when emacs-dsh--input-start
+    (unless (overlayp emacs-dsh--attachment-overlay)
+      (let ((pos (marker-position emacs-dsh--input-start)))
+        (setq emacs-dsh--attachment-overlay (make-overlay pos pos nil t t))
+        (overlay-put emacs-dsh--attachment-overlay 'priority 1)))
+    (move-overlay emacs-dsh--attachment-overlay
+                  (marker-position emacs-dsh--input-start)
+                  (marker-position emacs-dsh--input-start))
+    (overlay-put
+     emacs-dsh--attachment-overlay 'before-string
+     (when emacs-dsh--attachments
+       (concat "\n"
+               (string-join
+                (cl-loop for attachment in emacs-dsh--attachments
+                         for index from 0
+                         collect
+                         (let* ((mime (alist-get 'mediaType attachment))
+                                (type (cdr (assoc mime '(("image/png" . png)
+                                                          ("image/jpeg" . jpeg)
+                                                          ("image/webp" . webp)
+                                                          ("image/gif" . gif)))))
+                                (image (and (display-images-p) type
+                                            (ignore-errors
+                                              (create-image
+                                               (base64-decode-string
+                                                (alist-get 'data attachment))
+                                               type t :data-p t :max-width 200
+                                               :max-height 100 :margin '(4 . 4)))))
+                                (label (concat (if image
+                                                   (propertize " " 'display image)
+                                                 "[image]")
+                                               " " (or (alist-get 'name attachment) "image")
+                                               " ×  ")))
+                           (propertize label 'keymap emacs-dsh--image-remove-map
+                                       'emacs-dsh-image-index index
+                                       'mouse-face 'highlight
+                                       'help-echo "Click to remove staged image")))
+                "\n")
+               "\n")))))
+
+(defun emacs-dsh-remove-image (event)
+  "Remove the staged image clicked in the composer preview."
+  (interactive "e")
+  (let* ((hit (posn-string (event-start event)))
+         (index (and hit (get-text-property (cdr hit)
+                                            'emacs-dsh-image-index (car hit)))))
+    (unless (and (integerp index) (< index (length emacs-dsh--attachments)))
+      (user-error "No staged image at this position"))
+    (setq emacs-dsh--attachments
+          (append (cl-subseq emacs-dsh--attachments 0 index)
+                  (nthcdr (1+ index) emacs-dsh--attachments)))
+    (emacs-dsh--update-image-preview)
+    (force-mode-line-update)))
+
 (defun emacs-dsh--stage-image (mime name data)
   "Stage one MIME image with NAME and base64 DATA for the next prompt."
   (unless emacs-dsh--session-id (user-error "Not in a DSH chat"))
@@ -2119,6 +2589,7 @@ actual creation time.  Read all missing snapshots over one temporary socket."
         (append emacs-dsh--attachments
                 (list `((type . "image") (mediaType . ,mime)
                         (name . ,name) (data . ,data)))))
+  (emacs-dsh--update-image-preview)
   (force-mode-line-update)
   (message "emacs-dsh: image attached; send with C-c C-c"))
 

@@ -53,24 +53,27 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 
 | 操作 | 说明 |
 | --- | --- |
-| `M-x emacs-dsh-chat` 或 `<f7>` | 选择目录并创建新会话 |
-| `C-c C-r` 或 `/resume` | 恢复会话；列表按创建时间、session ID、首句交互三列对齐 |
+| `M-x emacs-dsh-chat` 或 `<f7>` | 选择目录并创建新会话；`C-u M-x emacs-dsh-chat` 可在创建前选择模式 |
+| `C-c C-r` 或 `/resume` | 在 minibuffer 中搜索 Host 列出的所有工作区的会话（可用 Vertico/Orderless）；按时间、session ID、工作目录和首句交互对齐显示；恢复后关闭原聊天 buffer（未发送的输入会先确认） |
 | `RET` 或 `C-c C-c` | 发送输入 |
 | `C-c C-s` / `C-c C-k` | 运行中 steer / 取消轮次 |
 | `C-c C-l` 或 `/queue` | 查看待发送与 steer 消息，并可编辑、删除或把排队消息转为 steer |
 | `C-c C-q` | 关闭 Emacs 聊天 buffer，不删除 Host 会话 |
+| `/mode` 或 `M-x emacs-dsh-select-mode` | 为**尚未开始对话**的会话选择模式（Standard、PTC、Minimal、Creator，按 Host 实际可用模式显示） |
 | `TAB` | 补全 `/` 命令、技能或 `@` 文件及跨会话引用 |
 | `C-c C-p`、`s-v` 或 `s-V` | 智能粘贴文本、文件引用或图片 |
 
-最近一条用户 query 固定在聊天窗口顶部；mode-line 显示会话 ID、状态、队列数量（`Q` 为待发送、`S` 为 steer）、模型、思考程度和项目路径。新会话会自动读取 Host 默认模型。`/model` 可选择模型，`/reasoning` 可选择当前模型支持的思考程度。`/help` 显示客户端命令及 Host 提供的命令；其他 Host 命令由 `commands/list` 发现并交给 Host 执行。已注册的 `/skill-name` 作为 prompt 提交。
+顶部状态行显示上下文 token 使用量（Host 提供时）、模型、推理程度和模式；Emacs 原有 mode-line 的聊天 buffer 名显示工作目录（同名目录的多个会话会自动编号），并追加 DSH 空闲/思考/工具执行/等待操作的动态状态及队列数量（`Q` 为待发送、`S` 为 steer）。最近一条用户 query 保留在聊天记录中。新会话会自动读取 Host 默认模型。`/model` 可选择模型，`/reasoning` 可选择当前模型支持的思考程度。`/help` 显示客户端命令及 Host 提供的命令；其他 Host 命令由 `commands/list` 发现并交给 Host 执行。已注册的 `/skill-name` 作为 prompt 提交。
 
-助手回复使用 `markdown-mode` 的 Emacs 原生样式显示标题、强调、代码和链接，并隐藏部分 Markdown 标记；buffer 中仍保留原文，复制和搜索得到的是原始 Markdown。HTTP(S) 链接可用 `RET` 或鼠标点击打开。流式回复先以轻量文本显示，消息完成后再排版。工具调用显示为带状态和参数摘要的卡片：`●` 运行中、`✓` 成功、`✗` 失败；把光标移到卡片标题后按 `RET` 或点击，可展开/收起完整参数和结果。较长的结果默认收起，以免遮住对话。
+助手回复使用 `markdown-mode` 的 Emacs 原生样式显示标题、强调、代码和链接，并隐藏部分 Markdown 标记；buffer 中仍保留原文，复制和搜索得到的是原始 Markdown。HTTP(S) 链接可用 `RET` 或鼠标点击打开。流式回复先以轻量文本显示，消息完成后再排版。工具调用显示为带状态和参数摘要的卡片：`●` 运行中、`✓` 成功、`✗` 失败；把光标移到卡片标题后按 `RET` 或点击，可展开/收起完整参数和结果。
 
-输入 `@` 后按 `TAB` 可从 Host 文件和其他会话中选择引用。跨会话引用直接插入 Host 返回的 `@[标题](dsh-session:…)` 文本；发送时无需另行打开源会话。`M-x emacs-dsh-insert-file` 可手动插入文件引用，`M-x emacs-dsh-attach-image` 可暂存图片。智能粘贴在 WSL 读取 Windows 剪贴板，在 macOS 读取本机剪贴板。
+输入 `@` 后按 `TAB` 可从 Host 文件和其他会话中选择引用。Host 没有文件候选时，会从当前工作目录就地补全文件和子目录。跨会话引用直接插入 Host 返回的 `@[标题](dsh-session:…)` 文本。`M-x emacs-dsh-insert-file` 可手动插入文件引用，`M-x emacs-dsh-attach-image` 可暂存图片；待发送图片显示在输入框上方，图形界面显示缩略图，点击预览即可移除。智能粘贴在 WSL 读取 Windows 剪贴板，在 macOS 读取本机剪贴板。
 
-`C-c C-l`（或 `/queue`）列出当前会话尚未被 Host 消费的消息。选择一条后可编辑纯文本、删除，或将待发送消息转为本轮 steer；后者仅在 Agent 运行时有效。队列内容来自 Host 的 `session/control` → `inbox` 实时投影，因此在其他客户端做的改动也会反映到 Emacs。网络断开重连后会重新读取队列快照。队列操作失败时原有项目保持不变，Host 错误会显示在 minibuffer。
+`C-c C-l`（或 `/queue`）列出当前会话尚未被 Host 消费的消息。选择一条后可编辑纯文本、删除，或将待发送消息转为本轮 steer；后者仅在 Agent 运行时有效。队列内容来自 Host 的 `session/control` → `inbox` 实时投影，网络断开重连后会重新读取队列快照。
 
-历史由 Host 保存。客户端初次加载最近 `emacs-dsh-max-messages` 条消息，随后通过 WebSocket 接收实时事件并支持重连。旧历史分页、历史图片预览、人工审批及交互式问答控件尚未实现；需要审批或回答的轮次请在 DSH Desktop/Web 中处理。
+历史由 Host 保存。`/resume` 的 minibuffer 搜索覆盖 `session/list` 返回的全部可见会话，不逐个请求历史快照；进入会话后初次加载最近 `emacs-dsh-max-messages` 条消息，随后通过 WebSocket 接收实时事件并支持重连。旧**消息**分页和历史图片预览尚未实现。
+
+Host 请求审批或提问时，客户端通过 `$events` 接收并在 minibuffer 中逐个处理：审批可“拒绝/仅本次允许”，问答支持选项、逗号分隔多选、自由文本和空输入跳过；`C-g` 取消问题组。关闭聊天 buffer 后该客户端不再接管该会话的请求，仍可由其他 DSH 客户端处理。切换模式只适用于空白会话；已开始对话的会话需要先新建会话再选择模式。
 
 ## 故障排查
 
