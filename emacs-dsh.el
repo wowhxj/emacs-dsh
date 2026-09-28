@@ -27,11 +27,7 @@
 
 (defgroup emacs-dsh nil "Emacs client for DeepSeek Harness." :group 'tools)
 (defface emacs-dsh-status-face
-  '((((class color) (background light))
-     :background "#d9eee8" :foreground "#214d48")
-    (((class color) (background dark))
-     :background "#29434b" :foreground "#e5f2ef")
-    (t :inherit mode-line))
+  '((t :inherit mode-line))
   "Face for the DSH mode-line status." :group 'emacs-dsh)
 (defface emacs-dsh-user-face
   '((((class color) (background light)) :background "#edf5f4" :foreground "#244b48")
