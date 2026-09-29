@@ -63,7 +63,7 @@ When using Windows Desktop with WSL Emacs, choose a new-session directory that t
 | `RET` or `C-c C-c` | Send the draft |
 | `Shift-Enter` | Insert a newline in the composer without sending |
 | `C-c C-s` / `C-c C-k` | Steer a running turn / cancel it |
-| `C-c C-l` or `/queue` | Manage pending and steer messages: edit text and add/remove images in the chat composer, remove messages, or turn a queued message into a steer |
+| `C-c C-l` or `/queue` | Manage pending and steer messages: edit a text message in the chat composer, remove messages, or turn a queued message into a steer |
 | `C-c C-q` | Close the Emacs chat buffer without deleting the Host session |
 | `/mode` or `M-x emacs-dsh-select-mode` | Select an agent preset **before any conversation begins** (Standard, PTC, Minimal, or Creator, as offered by the Host) |
 | `M-x emacs-dsh-permission` or `/permission <preset>` | Select permissions: read-only, workspace-write, full access, or Auto review (`auto`) if offered by the Host |
@@ -78,7 +78,7 @@ Assistant messages use Emacs's `markdown-mode` styling for headings, emphasis, c
 
 Type `@` then `TAB` to select Host files or other sessions. If the Host has no file candidates, local files and subdirectories under the current working directory are offered. Explicit home-relative and absolute paths are completed from the local filesystem, even outside the project. Cross-session references insert the Host-provided `@[title](dsh-session:…)` mention. `M-x emacs-dsh-insert-file` inserts a reference manually; `M-x emacs-dsh-attach-image` stages an image. Staged images appear above the composer as thumbnails in graphical Emacs; click a preview to remove it. Smart paste uses the Windows clipboard in WSL and the native clipboard on macOS.
 
-`C-c C-l` (or `/queue`) shows messages that the Host has not consumed. Select **Edit** to load its text and image previews into the chat composer rather than the minibuffer. Paste or attach new images, click existing previews to remove them, then press `C-c C-c` or `RET` to save; `C-c C-k` aborts and restores your original draft and attachments. You can also delete the entire message or turn a pending message into a steer for the current turn (only while the agent is running). Queue state comes from the Host's live `session/control` → `inbox` projection and is reloaded after reconnecting.
+`C-c C-l` (or `/queue`) shows messages that the Host has not consumed. Select **Edit** to load its text into the chat composer rather than the minibuffer, then press `RET` or `C-c C-c` to save; `C-c C-k` aborts and restores your original draft and attachments. As in DSH Desktop, only text messages can be edited: the Host replaces an edited message with text, so messages carrying images offer no **Edit**; remove such a message and send it again instead. You can also delete the entire message or turn a pending message into a steer for the current turn (only while the agent is running). Queue state comes from the Host's live `session/control` → `inbox` projection and is reloaded after reconnecting.
 
 History is saved by the Host. `/resume` searches all visible sessions from `session/list` without requesting snapshots for each result. Entering a session loads its latest `emacs-dsh-max-messages` messages, then receives live WebSocket events with reconnection support. Pagination of older **messages** is not implemented yet. Images included by the Host appear in graphical Emacs; text terminals show `[image]` instead.
 

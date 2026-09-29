@@ -63,7 +63,7 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 | `RET` 或 `C-c C-c` | 发送输入 |
 | `Shift-Enter` | 在输入框插入换行，不发送 |
 | `C-c C-s` / `C-c C-k` | 运行中 steer / 取消轮次 |
-| `C-c C-l` 或 `/queue` | 查看待发送与 steer 消息，在聊天输入框编辑文字、新增或移除图片，也可删除消息或转为 steer |
+| `C-c C-l` 或 `/queue` | 查看待发送与 steer 消息，在聊天输入框编辑纯文本消息，也可删除消息或转为 steer |
 | `C-c C-q` | 关闭 Emacs 聊天 buffer，不删除 Host 会话 |
 | `/mode` 或 `M-x emacs-dsh-select-mode` | 为**尚未开始对话**的会话选择模式（Standard、PTC、Minimal、Creator，按 Host 实际可用模式显示） |
 | `M-x emacs-dsh-permission` 或 `/permission <预设>` | 为当前会话选择权限：仅查看、工作区修改、完全权限；Host 提供时还可选 Auto review（值为 `auto`） |
@@ -78,7 +78,7 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 
 输入 `@` 后按 `TAB` 可从 Host 文件和其他会话中选择引用。Host 没有文件候选时，会从当前工作目录就地补全文件和子目录；显式输入 `@~/` 或绝对路径时，还可补全项目外的本机目录。跨会话引用直接插入 Host 返回的 `@[标题](dsh-session:…)` 文本。`M-x emacs-dsh-insert-file` 可手动插入文件引用，`M-x emacs-dsh-attach-image` 可暂存图片；待发送图片显示在输入框上方，图形界面显示缩略图，点击预览即可移除。智能粘贴在 WSL 读取 Windows 剪贴板，在 macOS 读取本机剪贴板。
 
-`C-c C-l`（或 `/queue`）列出当前会话尚未被 Host 消费的消息。选择「Edit」后，会在聊天主 buffer 的输入框中载入文字和图片预览，而非在 minibuffer 编辑；可继续粘贴／附加新图片，点击已有预览删除图片，按 `C-c C-c` 或 `RET` 保存，按 `C-c C-k` 取消并恢复原来的草稿和附件。也可删除整条消息，或将待发送消息转为本轮 steer；后者仅在 Agent 运行时有效。队列内容来自 Host 的 `session/control` → `inbox` 实时投影，网络断开重连后会重新读取队列快照。
+`C-c C-l`（或 `/queue`）列出当前会话尚未被 Host 消费的消息。选择「Edit」后，会在聊天主 buffer 的输入框中载入文字，而非在 minibuffer 编辑；按 `RET` 或 `C-c C-c` 保存，按 `C-c C-k` 取消并恢复原来的草稿和附件。与 DSH 桌面端一致，只有纯文本消息可以编辑：Host 会用文本整体替换被编辑的消息，因此带图片的消息不提供「Edit」，请删除后重新发送。也可删除整条消息，或将待发送消息转为本轮 steer；后者仅在 Agent 运行时有效。队列内容来自 Host 的 `session/control` → `inbox` 实时投影，网络断开重连后会重新读取队列快照。
 
 历史由 Host 保存。`/resume` 的 minibuffer 搜索覆盖 `session/list` 返回的全部可见会话，不逐个请求历史快照；进入会话后初次加载最近 `emacs-dsh-max-messages` 条消息，随后通过 WebSocket 接收实时事件并支持重连。旧**消息**分页尚未实现；Host 在消息内容中提供图片数据时，图形界面会显示图片，文字终端仍显示 `[image]`。
 

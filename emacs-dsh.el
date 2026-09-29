@@ -2684,11 +2684,14 @@ the identifying beginning and end of IDs and paths."
 (defun emacs-dsh--submit (mode)
   "Send the current draft as a command, skill, or ordinary prompt."
   (unless emacs-dsh--session-id (user-error "Not in a DSH chat"))
-  (when emacs-dsh--queue-edit (user-error "Finish the queue edit before sending"))
-  (let ((draft (emacs-dsh--draft-text)))
-    (if (string-prefix-p "/" draft)
-        (emacs-dsh--submit-slash mode draft)
-      (emacs-dsh--submit-prompt mode))))
+  ;; Queue-edit keys live on the field overlay, which misses point at the
+  ;; field's end; route here so RET and C-c C-c always save the edit.
+  (if emacs-dsh--queue-edit
+      (emacs-dsh-queue-edit-save)
+    (let ((draft (emacs-dsh--draft-text)))
+      (if (string-prefix-p "/" draft)
+          (emacs-dsh--submit-slash mode draft)
+        (emacs-dsh--submit-prompt mode)))))
 
 ;;;###autoload
 (defun emacs-dsh-send () "Submit the draft as a command, skill, or queued prompt." (interactive) (emacs-dsh--submit "queue"))
@@ -2696,11 +2699,14 @@ the identifying beginning and end of IDs and paths."
 (defun emacs-dsh-steer () "Steer a running turn with the draft." (interactive) (emacs-dsh--submit "steer"))
 ;;;###autoload
 (defun emacs-dsh-cancel ()
-  "Cancel the active turn (pending messages remain queued)."
+  "Cancel the active turn (pending messages remain queued).
+While a queue message is being edited, abort that edit instead."
   (interactive)
   (unless emacs-dsh--session-id (user-error "Not in a DSH chat"))
-  (emacs-dsh--call "session/cancel" `((request . ((sessionId . ,emacs-dsh--session-id))))
-                   (lambda (_) (message "emacs-dsh: cancelled"))))
+  (if emacs-dsh--queue-edit
+      (emacs-dsh-queue-edit-abort)
+    (emacs-dsh--call "session/cancel" `((request . ((sessionId . ,emacs-dsh--session-id))))
+                     (lambda (_) (message "emacs-dsh: cancelled")))))
 
 (defun emacs-dsh--queue-text (item)
   "Return a short display string for queue ITEM."
@@ -2727,10 +2733,12 @@ the identifying beginning and end of IDs and paths."
 (defun emacs-dsh--queue-edit-keymap-refresh ()
   "Use queue-edit composer bindings only while editing."
   (when-let* ((widget (emacs-dsh--input-widget)))
-    (widget-put widget :keymap (if emacs-dsh--queue-edit
-                                   emacs-dsh--queue-edit-input-keymap
-                                 emacs-dsh--input-keymap))
-    (widget-setup)))
+    (let ((map (if emacs-dsh--queue-edit
+                   emacs-dsh--queue-edit-input-keymap
+                 emacs-dsh--input-keymap)))
+      (widget-put widget :keymap map)
+      ;; `widget-setup' does not reapply :keymap to an existing field.
+      (overlay-put (widget-get widget :field-overlay) 'local-map map))))
 
 (defun emacs-dsh--queue-edit-finish ()
   "Return to the draft saved before queue editing."
@@ -2743,25 +2751,30 @@ the identifying beginning and end of IDs and paths."
       (emacs-dsh--update-image-preview)
       (force-mode-line-update))))
 
+(defun emacs-dsh--queue-text-only-p (item)
+  "Return non-nil when queue ITEM holds only text, the one kind DSH can edit."
+  (let ((content (alist-get 'content item)))
+    (cl-every (lambda (part) (equal (alist-get 'type part) "text"))
+              (if (vectorp content) (append content nil) content))))
+
 (defun emacs-dsh--queue-edit-start (item)
-  "Edit pending ITEM using this chat's composer and image preview."
+  "Edit the text of pending ITEM in this chat's composer.
+The Host replaces an edited message with text only, so, like DSH Desktop,
+messages carrying images or files cannot be edited."
   (when emacs-dsh--queue-edit (user-error "Finish the current queue edit first"))
+  (unless (emacs-dsh--queue-text-only-p item)
+    (user-error "DSH can only edit text messages; remove this one and send it again"))
   (let* ((content (alist-get 'content item))
-         (parts (if (vectorp content) (append content nil) content))
-         (text (mapconcat (lambda (part)
-                            (if (equal (alist-get 'type part) "text")
-                                (or (alist-get 'text part) "") ""))
-                          parts "\n"))
-         (images (cl-remove-if-not
-                  (lambda (part) (equal (alist-get 'type part) "image")) parts)))
+         (text (mapconcat (lambda (part) (or (alist-get 'text part) ""))
+                          (if (vectorp content) (append content nil) content) "")))
     (setq emacs-dsh--queue-edit (list item (emacs-dsh--draft-text)
                                       emacs-dsh--attachments)
-          emacs-dsh--attachments images)
+          emacs-dsh--attachments nil)
     (emacs-dsh--queue-edit-keymap-refresh)
     (emacs-dsh--replace-draft text)
     (emacs-dsh--update-image-preview)
     (emacs-dsh-focus-input)
-    (message "Editing queue: C-c C-c/RET save, C-c C-k abort; paste or click images")))
+    (message "Editing queue: RET or C-c C-c save, C-c C-k abort")))
 
 (defun emacs-dsh-queue-edit-abort ()
   "Discard the queue edit and restore the previous draft and images."
@@ -2774,13 +2787,12 @@ the identifying beginning and end of IDs and paths."
   "Save the edited queue message from the chat composer."
   (interactive)
   (unless emacs-dsh--queue-edit (user-error "No queue edit in progress"))
-  (let* ((item (car emacs-dsh--queue-edit))
-         (text (emacs-dsh--draft-text))
-         (content (append (unless (string-empty-p text)
-                            (list `((type . "text") (text . ,text))))
-                          emacs-dsh--attachments)))
-    (unless content (user-error "Queue message cannot be empty"))
-    (emacs-dsh--queue-update item "edit" content
+  (let ((item (car emacs-dsh--queue-edit))
+        (text (emacs-dsh--draft-text)))
+    (when (string-empty-p text) (user-error "Queue message cannot be empty"))
+    (when emacs-dsh--attachments
+      (user-error "Queue edits are text only; remove the staged images or abort"))
+    (emacs-dsh--queue-update item "edit" (list `((type . "text") (text . ,text)))
                              #'emacs-dsh--queue-edit-finish)))
 
 ;;;###autoload
@@ -2804,9 +2816,12 @@ the identifying beginning and end of IDs and paths."
     (when picked
       (let* ((placement (car picked))
              (item (cdr picked))
+             (editable (emacs-dsh--queue-text-only-p item))
              (kind (cdr (assoc (completing-read
-                                "Queue action: "
-                                (append '(("Edit" . "edit") ("Remove" . "remove"))
+                                (if editable "Queue action: "
+                                  "Queue action (messages with images cannot be edited): ")
+                                (append (when editable '(("Edit" . "edit")))
+                                        '(("Remove" . "remove"))
                                         (when (eq placement 'queued)
                                           '(("Steer into current turn" . "steer"))))
                                 nil t)
