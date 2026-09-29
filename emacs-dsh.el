@@ -1417,8 +1417,11 @@ DETAIL-TEXT is revealed on expansion; STATUS selects the header symbol."
                       (if failure
                           (format ": %s" (or (alist-get 'message failure) failure)) ""))
               (if failure 'error 'shadow)))
-           (emacs-dsh--insert-before-input (concat (emacs-dsh--turn-rule) "\n")
-                                           'emacs-dsh-turn-separator-face)))))
+           ;; Keep the rule's face off the blank line: GUI frames draw a
+           ;; newline as a glyph, which would show a stray struck-through dash.
+           (emacs-dsh--insert-before-input (emacs-dsh--turn-rule)
+                                           'emacs-dsh-turn-separator-face)
+           (emacs-dsh--insert-before-input "")))))
     (force-mode-line-update)))
 
 (defun emacs-dsh--stream (frame)
