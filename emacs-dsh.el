@@ -1805,11 +1805,53 @@ MAX-MESSAGES limits history included in the first snapshot."
 
 ;;;###autoload
 (defun emacs-dsh-chat (&optional root choose-mode)
-  "Create a DSH Session in ROOT using Standard by default.
-With prefix CHOOSE-MODE, select a preset before creation."
+  "Choose a DSH Session in ROOT, or create one if requested.
+With prefix CHOOSE-MODE, select a preset if creating a new session."
   (interactive (list (read-directory-name "DSH root: " (emacs-dsh--project-root) nil t)
                      current-prefix-arg))
   (setq root (file-name-as-directory (expand-file-name (or root (emacs-dsh--project-root)))))
+  (emacs-dsh--choose-session-for-root root choose-mode))
+
+(defun emacs-dsh--choose-session-for-root (root choose-mode)
+  "Offer ROOT's existing sessions, or create a new one there.
+CHOOSE-MODE asks for an agent preset only if a new session is selected."
+  (emacs-dsh--call
+   "session/list" `((_request . ,(make-hash-table)))
+   (lambda (value)
+     (let* ((local-root (expand-file-name root))
+            (items (cl-remove-if-not
+                    (lambda (item)
+                      (let* ((cwd (alist-get 'cwd item))
+                             (local-cwd (and cwd (emacs-dsh--local-path cwd))))
+                        (and local-cwd
+                             (equal (expand-file-name local-root)
+                                    (expand-file-name local-cwd)))))
+                    (alist-get 'items value)))
+            (new-label "[New session] "))
+       (if (null items)
+           (emacs-dsh--create-session-with-choice root choose-mode)
+         (let ((choices (append
+                         (mapcar (lambda (item)
+                                   (cons (emacs-dsh--session-choice-label item)
+                                         item))
+                                 items)
+                         (list (cons new-label :new)))))
+           (emacs-dsh--defer-picker
+            (lambda ()
+              (let ((choice
+                     (cdr (assoc
+                           (completing-read
+                            "Session in this directory (choose or create): "
+                            choices nil t)
+                           choices))))
+                (cond
+                 ((eq choice :new)
+                  (emacs-dsh--create-session-with-choice root choose-mode))
+                 (choice
+                  (emacs-dsh--show (alist-get 'sessionId choice) root))))))))))))
+
+(defun emacs-dsh--create-session-with-choice (root choose-mode)
+  "Create a new DSH session in ROOT, optionally prompting for a preset."
   (if choose-mode
       (emacs-dsh--pick-preset
        (lambda (preset) (emacs-dsh--create-session root preset)))
@@ -1876,10 +1918,50 @@ With prefix CHOOSE-MODE, select a preset before creation."
   (emacs-dsh--call
    "session/list" `((_request . ,(make-hash-table)))
    (lambda (value)
-     (let ((items (alist-get 'items value)))
-       (if items
-           (emacs-dsh--resume-picker items)
-         (message "emacs-dsh: no sessions"))))))
+     (emacs-dsh--archive-empty-sessions
+      (alist-get 'items value)
+      (lambda (items)
+        (if items
+            (emacs-dsh--resume-picker items)
+          (message "emacs-dsh: no sessions")))))))
+
+(defun emacs-dsh--archive-empty-sessions (items callback)
+  "Archive idle blank sessions from ITEMS, then call CALLBACK with survivors.
+Only rows whose `blank' flag is explicitly true and `running' is false are
+eligible.  Leave sessions with open Emacs chat buffers untouched."
+  (let ((candidates
+         (cl-remove-if-not
+          (lambda (item)
+            (let ((id (alist-get 'sessionId item)))
+              (and (eq (alist-get 'blank item) t)
+                   (assq 'running item)
+                   (not (eq (alist-get 'running item) t))
+                   (not (buffer-live-p (gethash id emacs-dsh--chats))))))
+          items))
+        (archived 0)
+        (remaining (copy-sequence items)))
+    (cl-labels
+        ((archive-next (pending)
+           (if (null pending)
+               (progn
+                 (when (> archived 0)
+                   (message "emacs-dsh: archived %d empty session%s"
+                            archived (if (= archived 1) "" "s")))
+                 (funcall callback remaining))
+             (let* ((item (car pending))
+                    (id (alist-get 'sessionId item)))
+               (emacs-dsh--call
+                "workspace/archiveSession"
+                `((request . ((sessionId . ,id))))
+                (lambda (_value)
+                  (setq archived (1+ archived)
+                        remaining (delq item remaining))
+                  (archive-next (cdr pending)))
+                (lambda (failure)
+                  (message "emacs-dsh: could not archive empty session %s: %s"
+                           id failure)
+                  (archive-next (cdr pending))))))))
+      (archive-next candidates))))
 
 (defun emacs-dsh--session-creation-times (items callback)
   "Read immutable creation times for ITEMS, then call CALLBACK.
