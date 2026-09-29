@@ -1035,7 +1035,7 @@ END-TIME is the Host time in ms of `turn/end', used for the total duration."
 
 (defun emacs-dsh--insert-message (label text &optional user content)
   "Insert LABEL and TEXT as a readable transcript message.
-Assistant TEXT is rendered as Markdown; USER CONTENT may contain images."
+TEXT and text blocks in USER CONTENT are rendered as Markdown; USER CONTENT may contain images."
   (let* ((body (if user
                    (if content
                        (mapconcat (lambda (block)
@@ -1043,7 +1043,8 @@ Assistant TEXT is rendered as Markdown; USER CONTENT may contain images."
                                         (emacs-dsh--image-block block)
                                       (pcase (alist-get 'type block)
                                         ((or "text" "reasoning")
-                                         (or (alist-get 'text block) ""))
+                                         (emacs-dsh--markdown-text
+                                          (or (alist-get 'text block) "")))
                                         ("file" "[file]") (_ ""))))
                                   (if (vectorp content) (append content nil) content)
                                   "\n")

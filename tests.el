@@ -402,6 +402,19 @@
     (should (string-match-p "Reason: Permission denied" (buffer-string)))
     (should (string-match-p "\\[turn error: runtime stopped\\]" (buffer-string)))))
 
+(ert-deftest emacs-dsh-user-message-renders-markdown ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--compose)
+    (emacs-dsh--insert-message
+     "You: " "ignored" t
+     '(((type . "text") (text . "**bold user text**"))))
+    (should (string-match-p "\\*\\*bold user text\\*\\*" (buffer-string)))
+    (goto-char (point-min))
+    (search-forward "bold user text")
+    (should (or (get-text-property (point) 'face)
+                (get-text-property (point) 'font-lock-face)))))
+
 (ert-deftest emacs-dsh-markdown-message-keeps-source-and-styles-heading ()
   (with-temp-buffer
     (emacs-dsh-chat-mode)
