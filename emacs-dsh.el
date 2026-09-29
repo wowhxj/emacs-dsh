@@ -82,8 +82,9 @@ and on macOS, nil sends paths unchanged."
 (defcustom emacs-dsh-max-messages 100
   "Number of messages in the first history snapshot."
   :type 'integer :group 'emacs-dsh)
-(defcustom emacs-dsh-show-reasoning nil
-  "Whether to display assistant reasoning blocks." :type 'boolean :group 'emacs-dsh)
+(defcustom emacs-dsh-show-reasoning t
+  "Whether to show assistant reasoning as collapsed Thinking steps."
+  :type 'boolean :group 'emacs-dsh)
 (defcustom emacs-dsh-default-permission "auto"
   "Permission for newly created sessions; auto falls back to danger-full-access.
 The fallback is used only when the Host does not offer auto."
@@ -126,6 +127,8 @@ The fallback is used only when the Host does not offer auto."
 (defvar-local emacs-dsh--turn-start nil)
 (defvar-local emacs-dsh--final-start nil)
 (defvar-local emacs-dsh--turn-has-process nil)
+(defvar-local emacs-dsh--turn-time nil "Host time in ms when the current turn began.")
+(defvar-local emacs-dsh--turn-steps 0 "Number of step lines in the current turn.")
 (defvar-local emacs-dsh--prompt-history nil)
 (defvar-local emacs-dsh--history-index nil)
 (defvar-local emacs-dsh--history-draft nil)
@@ -924,29 +927,53 @@ The original characters remain in the transcript for copying and search."
 (defvar emacs-dsh--process-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") #'emacs-dsh-toggle-process)
+    (define-key map (kbd "TAB") #'emacs-dsh-toggle-process)
     (define-key map [mouse-1] #'emacs-dsh-toggle-process)
     map)
   "Keymap on a folded process heading.")
 
-(defun emacs-dsh--fold-process ()
-  "Collapse the intermediate transcript for the current finished turn."
-  (when (and emacs-dsh--turn-has-process
-             emacs-dsh--turn-start emacs-dsh--final-start
+(defun emacs-dsh--format-duration (ms)
+  "Format MS milliseconds as a compact duration such as 8m 37s."
+  (let ((seconds (max 0 (round (/ ms 1000.0)))))
+    (cond ((< seconds 60) (format "%ds" seconds))
+          ((< seconds 3600) (format "%dm %ds" (/ seconds 60) (% seconds 60)))
+          (t (format "%dh %dm" (/ seconds 3600) (/ (% seconds 3600) 60))))))
+
+(defun emacs-dsh--process-heading (label expanded)
+  "Return the folded process heading for LABEL, EXPANDED or not."
+  (propertize (concat (if expanded "▾ " "▸ ") label) 'face 'shadow))
+
+(defun emacs-dsh--fold-process (&optional end-time)
+  "Collapse the intermediate transcript for the current finished turn.
+END-TIME is the Host time in ms of `turn/end', used for the total duration."
+  ;; A turn that failed before replying folds everything up to its end.
+  (unless emacs-dsh--final-start
+    (setq emacs-dsh--final-start
+          (copy-marker (or emacs-dsh--input-start (point-max)) nil)))
+  (when (and emacs-dsh--turn-has-process emacs-dsh--turn-start
              (< (marker-position emacs-dsh--turn-start)
                 (marker-position emacs-dsh--final-start)))
-    (let ((inhibit-read-only t))
+    (let ((inhibit-read-only t)
+          (label (concat "Process"
+                         (when (and (numberp emacs-dsh--turn-time) (numberp end-time))
+                           (concat " · " (emacs-dsh--format-duration
+                                          (- end-time emacs-dsh--turn-time))))
+                         (when (> emacs-dsh--turn-steps 0)
+                           (format " · %d step%s" emacs-dsh--turn-steps
+                                   (if (= emacs-dsh--turn-steps 1) "" "s"))))))
       (save-excursion
         (goto-char emacs-dsh--turn-start)
         (let ((heading (point)))
-          (insert "▸ Process (RET to expand)\n")
+          (insert (emacs-dsh--process-heading label nil) "\n")
           (add-text-properties heading (point)
                                '(read-only t rear-nonsticky (read-only)))
           (let ((header (make-overlay heading (1- (point)) nil t nil))
                 (body (make-overlay (point) emacs-dsh--final-start nil nil nil)))
             (overlay-put header 'emacs-dsh-process body)
+            (overlay-put header 'emacs-dsh-process-label label)
             (overlay-put header 'keymap emacs-dsh--process-map)
             (overlay-put header 'mouse-face 'highlight)
-            (overlay-put header 'help-echo "RET or click: toggle intermediate steps")
+            (overlay-put header 'help-echo "RET, TAB or click: toggle intermediate steps")
             (overlay-put body 'invisible 'emacs-dsh-process))))))
   (setq emacs-dsh--turn-start nil emacs-dsh--final-start nil
         emacs-dsh--turn-has-process nil))
@@ -963,8 +990,9 @@ The original characters remain in the transcript for copying and search."
     (unless body (user-error "Move to a DSH process heading first"))
     (let ((hidden (overlay-get body 'invisible)))
       (overlay-put body 'invisible (unless hidden 'emacs-dsh-process))
-      (overlay-put header 'display (if hidden "▾ Process (RET to collapse)"
-                               "▸ Process (RET to expand)")))))
+      (overlay-put header 'display
+                   (emacs-dsh--process-heading
+                    (overlay-get header 'emacs-dsh-process-label) hidden)))))
 
 (defun emacs-dsh--insert-message (label text &optional user content)
   "Insert LABEL and TEXT as a readable transcript message.
@@ -1007,6 +1035,7 @@ Assistant TEXT is rendered as Markdown; USER CONTENT may contain images."
 (defvar emacs-dsh--tool-header-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") #'emacs-dsh-toggle-tool-details)
+    (define-key map (kbd "TAB") #'emacs-dsh-toggle-tool-details)
     (define-key map [mouse-1] #'emacs-dsh-toggle-tool-details)
     map)
   "Keymap on a tool card header.")
@@ -1034,7 +1063,7 @@ Assistant TEXT is rendered as Markdown; USER CONTENT may contain images."
                  ('success 'emacs-dsh-tool-success-face)
                  ('error 'emacs-dsh-tool-error-face)
                  (_ 'emacs-dsh-tool-face)))
-         (symbol (pcase status ('success "✓") ('error "✗") (_ "●")))
+         (symbol (pcase status ('success "✓") ('error "✗") ('thought "✻") (_ "●")))
          (summary (emacs-dsh--tool-card-summary card)))
     (concat
      (propertize (format "  %s %s "
@@ -1066,22 +1095,29 @@ Assistant TEXT is rendered as Markdown; USER CONTENT may contain images."
 
 (defun emacs-dsh--make-tool-card (id name arguments)
   "Insert a collapsed tool card for ID, NAME and ARGUMENTS."
+  (emacs-dsh--make-step
+   id name (emacs-dsh--tool-summary arguments)
+   (if (and (stringp arguments) (not (string-empty-p arguments)))
+       (concat "    Arguments:\n" (replace-regexp-in-string "^" "    " arguments) "\n")
+     "    Arguments: none\n")
+   'running))
+
+(defun emacs-dsh--make-step (id name summary detail-text status)
+  "Insert a collapsed one-line step ID showing NAME and SUMMARY.
+DETAIL-TEXT is revealed on expansion; STATUS selects the header symbol."
   (let ((inhibit-read-only t)
         (widget (emacs-dsh--input-widget))
         card)
+    (when emacs-dsh--turn-start
+      (setq emacs-dsh--turn-has-process t)
+      (cl-incf emacs-dsh--turn-steps))
     (save-excursion
       (goto-char (if (and widget emacs-dsh--input-start)
                      emacs-dsh--input-start (point-max)))
       (let ((header-start (point)))
         (insert "Tool\n")
         (let* ((header (make-overlay header-start (1- (point)) nil t nil))
-               (details-start (point))
-               (detail-text (if (and (stringp arguments)
-                                     (not (string-empty-p arguments)))
-                                (concat "    Arguments:\n"
-                                        (replace-regexp-in-string
-                                         "^" "    " arguments) "\n")
-                              "    Arguments: none\n")))
+               (details-start (point)))
           (insert detail-text "\n")
           (add-text-properties header-start (point)
                                '(read-only t rear-nonsticky (read-only)))
@@ -1090,9 +1126,9 @@ Assistant TEXT is rendered as Markdown; USER CONTENT may contain images."
           (let ((details (make-overlay details-start (point) nil nil nil))
                 (end (copy-marker (point) nil)))
             (setq card (emacs-dsh--tool-card-create
-                        :id id :name name :summary (emacs-dsh--tool-summary arguments)
+                        :id id :name name :summary summary
                         :header header :details details :end end
-                        :expanded nil :status 'running))
+                        :expanded nil :status status))
             (overlay-put header 'emacs-dsh-tool-card card)
             (overlay-put header 'keymap emacs-dsh--tool-header-map)
             (overlay-put header 'mouse-face 'highlight)
@@ -1239,12 +1275,34 @@ Assistant TEXT is rendered as Markdown; USER CONTENT may contain images."
                           (if (vectorp content) (append content nil) content)) ""))
             (emacs-dsh--insert-message "You: " text t
                                        (alist-get 'content message))
-            (unless emacs-dsh--turn-start
+            ;; The prompt arrives after `turn/start'; keep it out of the fold.
+            (if emacs-dsh--turn-start
+                (unless (or emacs-dsh--turn-has-process emacs-dsh--final-start)
+                  (set-marker emacs-dsh--turn-start emacs-dsh--input-start))
               (setq emacs-dsh--turn-start
                     (copy-marker emacs-dsh--input-start nil))))))
         ("assistant/message"
          (let* ((message (alist-get 'message data))
-                (text (emacs-dsh--content (alist-get 'content message))))
+                (blocks (alist-get 'content message))
+                (blocks (if (vectorp blocks) (append blocks nil) blocks))
+                ;; Tool calls are drawn by `tool/call'; reasoning becomes a step.
+                (text (emacs-dsh--content
+                       (cl-remove-if (lambda (block)
+                                       (member (alist-get 'type block)
+                                               '("reasoning" "tool-call")))
+                                     blocks))))
+          (when emacs-dsh-show-reasoning
+            (cl-loop for block in blocks
+                     for index from 0
+                     for thought = (and (equal (alist-get 'type block) "reasoning")
+                                        (string-trim (or (alist-get 'text block) "")))
+                     when (and thought (not (string-empty-p thought)))
+                     do (emacs-dsh--make-step
+                         (format "reasoning:%s:%d" seq index) "Thinking"
+                         (emacs-dsh--tool-summary
+                          (replace-regexp-in-string "\\*\\*\\|^#+ *" "" thought))
+                         (concat (replace-regexp-in-string "^" "    " thought) "\n")
+                         'thought)))
           (when (and emacs-dsh--turn-start (not (string-empty-p text)))
             (when emacs-dsh--final-start (setq emacs-dsh--turn-has-process t))
             (setq emacs-dsh--final-start (copy-marker emacs-dsh--input-start nil)))
@@ -1280,7 +1338,9 @@ Assistant TEXT is rendered as Markdown; USER CONTENT may contain images."
          (setq emacs-dsh--task-turn-open t
                emacs-dsh--task-next-turn-claimed nil
                emacs-dsh--task-first-step nil
-               emacs-dsh--last-prompt nil)
+               emacs-dsh--last-prompt nil
+               emacs-dsh--turn-time (alist-get 'time event)
+               emacs-dsh--turn-steps 0)
           (unless emacs-dsh--turn-start
             (setq emacs-dsh--turn-start
                   (copy-marker (or emacs-dsh--input-start (point-max)) nil)))
@@ -1291,7 +1351,7 @@ Assistant TEXT is rendered as Markdown; USER CONTENT may contain images."
                            emacs-dsh--task-next-turn-claimed nil
                            emacs-dsh--task-first-step nil)
          (emacs-dsh--set-running nil)
-         (emacs-dsh--fold-process)
+         (emacs-dsh--fold-process (alist-get 'time event))
          (let* ((reason (alist-get 'reason data))
                 (failure (alist-get 'error reason)))
            (emacs-dsh--insert-before-input
