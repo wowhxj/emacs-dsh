@@ -2203,7 +2203,7 @@ the identifying beginning and end of IDs and paths."
          (created (if (> activity-time 0)
                       activity-time
                     (let ((cached (gethash id emacs-dsh--created-at)))
-                      (if (numberp cached) (/ cached 1000.0) 0)))
+                      (if (numberp cached) (/ cached 1000.0) 0))))
          (date (if (> created 0)
                    (format-time-string "%Y-%m-%d %H:%M"
                                        (seconds-to-time created))
