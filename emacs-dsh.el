@@ -55,6 +55,10 @@
 (defface emacs-dsh-tool-detail-face
   '((t :inherit fixed-pitch :foreground "gray60"))
   "Face for expanded tool details." :group 'emacs-dsh)
+(defface emacs-dsh-turn-separator-face
+  '((((type tty)) :inherit shadow)
+    (t :inherit shadow :strike-through t))
+  "Face for the full-width rule that ends each turn." :group 'emacs-dsh)
 (defcustom emacs-dsh-connection-mode 'auto
   "How Emacs connects to a local DSH Host.
 `auto' prefers the local Desktop bridge file when present, otherwise starts
@@ -850,6 +854,15 @@ An existing but invalid bridge must fail validation, not silently fall back."
       (widget-setup)
       (goto-char (+ (emacs-dsh--draft-beginning) (length text))))))
 
+(defun emacs-dsh--turn-rule ()
+  "Return a full-width rule for the end of a turn.
+Graphical frames strike through a stretch space, which follows resizing;
+terminals draw no face on stretch glyphs, so they get box-drawing dashes."
+  (if (display-graphic-p)
+      (propertize " " 'display '(space :align-to right))
+    (let ((window (get-buffer-window)))
+      (make-string (max 1 (1- (if window (window-body-width window) 80))) ?─))))
+
 (defun emacs-dsh--insert-before-input (text &optional face)
   (let ((inhibit-read-only t)
         (widget (emacs-dsh--input-widget)))
@@ -1035,7 +1048,8 @@ END-TIME is the Host time in ms of `turn/end', used for the total duration."
 
 (defun emacs-dsh--insert-message (label text &optional user content)
   "Insert LABEL and TEXT as a readable transcript message.
-TEXT and text blocks in USER CONTENT are rendered as Markdown; USER CONTENT may contain images."
+TEXT and text blocks in USER CONTENT are rendered as Markdown;
+USER CONTENT may contain images."
   (let* ((body (if user
                    (if content
                        (mapconcat (lambda (block)
@@ -1394,12 +1408,17 @@ DETAIL-TEXT is revealed on expansion; STATUS selects the header symbol."
          (emacs-dsh--set-running nil)
          (emacs-dsh--fold-process (alist-get 'time event))
          (let* ((reason (alist-get 'reason data))
+                (kind (or (alist-get 'kind reason) "ended"))
                 (failure (alist-get 'error reason)))
-           (emacs-dsh--insert-before-input
-            (format "[turn %s%s]" (or (alist-get 'kind reason) "ended")
-                    (if failure
-                        (format ": %s" (or (alist-get 'message failure) failure)) ""))
-            'shadow)))))
+           ;; A completed turn needs no label; the rule alone separates turns.
+           (unless (equal kind "completed")
+             (emacs-dsh--insert-before-input
+              (format "[turn %s%s]" kind
+                      (if failure
+                          (format ": %s" (or (alist-get 'message failure) failure)) ""))
+              (if failure 'error 'shadow)))
+           (emacs-dsh--insert-before-input (concat (emacs-dsh--turn-rule) "\n")
+                                           'emacs-dsh-turn-separator-face)))))
     (force-mode-line-update)))
 
 (defun emacs-dsh--stream (frame)
