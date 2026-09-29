@@ -1885,9 +1885,8 @@ CHOOSE-MODE asks for an agent preset only if a new session is selected."
                      (lambda (item)
                        (let* ((cwd (alist-get 'cwd item))
                               (local-cwd (and cwd (emacs-dsh--local-path cwd))))
-                         (and local-cwd
-                              (equal (expand-file-name local-root)
-                                     (expand-file-name local-cwd)))))
+                         ;; Workspace cwds are realpaths without a trailing slash.
+                         (and local-cwd (file-equal-p local-root local-cwd))))
                      (alist-get 'items value))))
             (new-label "[New session] "))
        (if (null items)
@@ -1941,11 +1940,26 @@ CHOOSE-MODE asks for an agent preset only if a new session is selected."
        (message "emacs-dsh: default permission unavailable: %s" failure)))))
 
 (defun emacs-dsh--create-session (root preset)
-  "Create a session in ROOT with optional PRESET."
+  "Create a session in ROOT's Host workspace with optional PRESET.
+The workspace groups it with Desktop sessions of the same directory; a Host
+without workspaces gets a plain cwd session, shown there as ungrouped."
+  (let ((path (emacs-dsh--host-path (directory-file-name root))))
+    (emacs-dsh--call
+     "workspace/create" `((request . ((path . ,path))))
+     (lambda (value)
+       (emacs-dsh--create-session-in
+        `((workspaceId . ,(alist-get 'workspaceId (alist-get 'workspace value))))
+        root preset))
+     (lambda (failure)
+       (message "emacs-dsh: workspace unavailable, session will be ungrouped: %s"
+                failure)
+       (emacs-dsh--create-session-in `((cwd . ,path)) root preset)))))
+
+(defun emacs-dsh--create-session-in (place root preset)
+  "Create a session at PLACE (workspaceId or cwd) for chat ROOT with PRESET."
   (emacs-dsh--call
    "session/create"
-   `((request . ,(append `((cwd . ,(emacs-dsh--host-path root)))
-                          (when preset `((agentPreset . ,preset))))))
+   `((request . ,(append place (when preset `((agentPreset . ,preset))))))
    (lambda (value)
      (let ((session (alist-get 'sessionId value)))
        (emacs-dsh--call

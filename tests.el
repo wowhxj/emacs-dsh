@@ -1570,6 +1570,7 @@
                  (should (equal endpoint "session/list"))
                  (funcall success
                           '((items . (((sessionId . "same-dir") (cwd . "/tmp/"))
+                                      ((sessionId . "workspace-cwd") (cwd . "/tmp"))
                                       ((sessionId . "other-dir") (cwd . "/elsewhere/"))))))))
               ((symbol-function 'emacs-dsh--local-path) #'identity)
               ((symbol-function 'emacs-dsh--defer-picker)
@@ -1585,8 +1586,8 @@
       (emacs-dsh-chat "/tmp/" nil))
     (should (equal shown '("same-dir" "/tmp/")))
     (should-not created)
-    (should (= (length chosen) 2))
-    (should (string-match-p "New session" (cadr chosen)))))
+    (should (= (length chosen) 3))
+    (should (string-match-p "New session" (nth 2 chosen)))))
 
 (ert-deftest emacs-dsh-mode-choices-and-blank-selection ()
   (should (equal (emacs-dsh--preset-choices
@@ -1686,10 +1687,12 @@
   (dolist (case '((((value . "read-only") (name . "read"))
                    ((value . "auto") (name . "Auto")))
                   (((value . "read-only") (name . "read")))))
-    (let (created selected shown)
+    (let (workspace created selected shown)
       (cl-letf (((symbol-function 'emacs-dsh--call)
                  (lambda (endpoint args success &optional _error)
                    (pcase endpoint
+                     ("workspace/create" (setq workspace args)
+                      (funcall success '((workspace . ((workspaceId . "w1"))))))
                      ("session/create" (setq created args)
                       (funcall success '((sessionId . "session-1"))))
                      ("permissionPresets/catalog"
@@ -1699,7 +1702,8 @@
                 ((symbol-function 'emacs-dsh--show)
                  (lambda (session root) (setq shown (list session root)))))
         (emacs-dsh--create-session "/tmp/" nil))
-      (should (equal (alist-get 'cwd (alist-get 'request created)) "/tmp/"))
+      (should (equal (alist-get 'path (alist-get 'request workspace)) "/tmp"))
+      (should (equal (alist-get 'request created) '((workspaceId . "w1"))))
       (should (equal (alist-get 'agentId selected) "session-1"))
       (should (equal (alist-get 'line selected)
                      (concat "/permission " (if (assoc 'value (cadr case))
@@ -1707,17 +1711,20 @@
       (should (equal shown '("session-1" "/tmp/"))))))
 
 (ert-deftest emacs-dsh-default-permission-catalog-error-uses-full-access ()
-  (let (selected shown)
+  (let (created selected shown)
     (cl-letf (((symbol-function 'emacs-dsh--call)
                (lambda (endpoint args success &optional failure)
                  (pcase endpoint
-                   ("session/create" (funcall success '((sessionId . "s1"))))
+                   ("workspace/create" (funcall failure "unknown method"))
+                   ("session/create" (setq created args)
+                    (funcall success '((sessionId . "s1"))))
                    ("permissionPresets/catalog" (funcall failure "unavailable"))
                    ("commands/execute" (setq selected (alist-get 'line args))
                     (funcall success '((result . ((kind . "success")))))))))
               ((symbol-function 'emacs-dsh--show)
                (lambda (id _root) (setq shown id))))
       (emacs-dsh--create-session "/tmp/" nil))
+    (should (equal (alist-get 'request created) '((cwd . "/tmp"))))
     (should (equal selected "/permission danger-full-access"))
     (should (equal shown "s1"))))
 
@@ -1737,6 +1744,8 @@
     (cl-letf (((symbol-function 'emacs-dsh--call)
                (lambda (endpoint args success &optional _error)
                   (pcase endpoint
+                    ("workspace/create"
+                     (funcall success '((workspace . ((workspaceId . "w1"))))))
                     ("session/create"
                      (setq created args)
                      (funcall success '((sessionId . "s1"))))
