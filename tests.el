@@ -1159,7 +1159,7 @@
                       (projections (values
                                     (turnOutline ((prompt . "Find my prompt")))))))))
         (should (string-match-p "session-1…56789abc" label))
-        (should (string-match-p "/private/tmp/very…ld/not/dominate" label))
+        (should (string-match-p "/private/tmp/ver…ld/not/dominate" label))
         (should (string-match-p "Find my prompt" label))
         (should (< (string-width label) 100))))))
 

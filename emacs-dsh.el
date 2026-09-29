@@ -24,6 +24,7 @@
 (require 'websocket)
 (require 'markdown-mode)
 (require 'browse-url)
+(defvar vertico-sort-function)          ; let-bound dynamically to keep our order
 
 (defgroup emacs-dsh nil "Emacs client for DeepSeek Harness." :group 'tools)
 (defface emacs-dsh-status-face
@@ -2178,7 +2179,7 @@ actual creation time.  Read all missing snapshots over one temporary socket."
              (tail-start (- total tail-width)))
         (concat (truncate-string-to-width string head-width)
                 "…"
-                (truncate-string-to-width string tail-width nil tail-start))))))
+                (truncate-string-to-width string total tail-start))))))
 
 (defun emacs-dsh--session-choice-label (item &optional _id-width _workspace-width)
   "Format ITEM as date, shortened ID, directory, and prompt preview.
