@@ -1057,8 +1057,16 @@
       (should (string-match-p "First request continued" label))
       (should (string-match-p "^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] " label))
       (should (= (string-match "First request" label)
-                 60))
+                 72))
       (should (string-match-p "/tmp/project" label)))))
+
+(ert-deftest emacs-dsh-session-sort-newest-orders-by-last-activity ()
+  (should (equal (mapcar (lambda (item) (alist-get 'sessionId item))
+                         (emacs-dsh--session-sort-newest
+                          '(((sessionId . "old") (updatedAt . 10))
+                            ((sessionId . "new") (updatedAt . 30))
+                            ((sessionId . "middle") (updatedAt . 20)))))
+                 '("new" "middle" "old"))))
 
 (ert-deftest emacs-dsh-session-choice-label-bounds-long-columns ()
   (let ((emacs-dsh--created-at (make-hash-table :test #'equal)))
@@ -1068,8 +1076,8 @@
                     '((sessionId . "session-12345678-1234-1234-1234-123456789abc")
                       (projections (values
                                     (turnOutline ((prompt . "Find my prompt")))))))))
-        (should (string-match-p "session-12345…" label))
-        (should (string-match-p "/private/tmp/very/lo…" label))
+        (should (string-match-p "session-1…56789abc" label))
+        (should (string-match-p "/private/tmp/very…ld/not/dominate" label))
         (should (string-match-p "Find my prompt" label))
         (should (< (string-width label) 100))))))
 

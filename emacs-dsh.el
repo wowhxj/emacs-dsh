@@ -1819,14 +1819,15 @@ CHOOSE-MODE asks for an agent preset only if a new session is selected."
    "session/list" `((_request . ,(make-hash-table)))
    (lambda (value)
      (let* ((local-root (expand-file-name root))
-            (items (cl-remove-if-not
-                    (lambda (item)
-                      (let* ((cwd (alist-get 'cwd item))
-                             (local-cwd (and cwd (emacs-dsh--local-path cwd))))
-                        (and local-cwd
-                             (equal (expand-file-name local-root)
-                                    (expand-file-name local-cwd)))))
-                    (alist-get 'items value)))
+            (items (emacs-dsh--session-sort-newest
+                    (cl-remove-if-not
+                     (lambda (item)
+                       (let* ((cwd (alist-get 'cwd item))
+                              (local-cwd (and cwd (emacs-dsh--local-path cwd))))
+                         (and local-cwd
+                              (equal (expand-file-name local-root)
+                                     (expand-file-name local-cwd)))))
+                     (alist-get 'items value))))
             (new-label "[New session] "))
        (if (null items)
            (emacs-dsh--create-session-with-choice root choose-mode)
@@ -1834,7 +1835,7 @@ CHOOSE-MODE asks for an agent preset only if a new session is selected."
                          (mapcar (lambda (item)
                                    (cons (emacs-dsh--session-choice-label item)
                                          item))
-                                 items)
+                                 (emacs-dsh--session-sort-newest items))
                          (list (cons new-label :new)))))
            (emacs-dsh--defer-picker
             (lambda ()
@@ -2044,6 +2045,7 @@ actual creation time.  Read all missing snapshots over one temporary socket."
 
 (defun emacs-dsh--resume-picker (items)
   "Show sessions with compact ID and directory columns and a useful prompt."
+  (setq items (emacs-dsh--session-sort-newest items))
   (let ((choices (mapcar (lambda (item)
                            (cons (emacs-dsh--session-choice-label item)
                                  item))
@@ -2079,11 +2081,30 @@ actual creation time.  Read all missing snapshots over one temporary socket."
                  (when (derived-mode-p 'emacs-dsh-chat-mode)
                    (kill-buffer source)))))))))))
 
-(defun emacs-dsh--session-choice-label (item &optional _id-width _workspace-width)
-  "Format ITEM as date, short ID, directory, and prompt preview.
+(defun emacs-dsh--session-sort-newest (items)
+  "Return ITEMS sorted by most recent activity, newest first."
+  (sort (copy-sequence items)
+        (lambda (a b)
+          (> (or (alist-get 'updatedAt a) (alist-get 'createdAt a) 0)
+             (or (alist-get 'updatedAt b) (alist-get 'createdAt b) 0)))))
 
-The completion UI adapts to the current window width; fixed caps keep IDs
-and long temporary paths from pushing the identifying prompt off-screen."
+(defun emacs-dsh--middle-truncate (string width)
+  "Truncate STRING to WIDTH columns, preserving its beginning and end."
+  (if (<= (string-width string) width)
+      string
+    (let* ((content-width (max 2 (1- width)))
+           (head-width (/ (+ content-width 1) 2))
+           (tail-width (- content-width head-width))
+           (tail-start (- (string-width string) tail-width)))
+      (concat (truncate-string-to-width string head-width)
+              "…"
+              (truncate-string-to-width string tail-width tail-start)))))
+
+(defun emacs-dsh--session-choice-label (item &optional _id-width _workspace-width)
+  "Format ITEM as date, shortened ID, directory, and prompt preview.
+
+The completion UI adapts to the current window width; compact columns preserve
+the identifying beginning and end of IDs and paths."
   (let* ((values (alist-get 'values (alist-get 'projections item)))
          (outline (alist-get 'turnOutline values))
          (first-prompt (and outline (alist-get 'prompt (car outline))))
@@ -2094,19 +2115,19 @@ and long temporary paths from pushing the identifying prompt off-screen."
                         (t "(empty session)")))
          (clean (replace-regexp-in-string "[[:space:]\n\r]+" " " preview))
          (id (alist-get 'sessionId item))
-         (short-id (truncate-string-to-width id 14 nil nil "…"))
-         (workspace (truncate-string-to-width (emacs-dsh--workspace-label item)
-                                              24 nil nil "…"))
+         (short-id (emacs-dsh--middle-truncate id 18))
+         (workspace (emacs-dsh--middle-truncate (emacs-dsh--workspace-label item)
+                                                32))
          (prompt-width (max 12 (min 76 (- (window-body-width) 48))))
-         (created (or (gethash id emacs-dsh--created-at)
-                      (alist-get 'createdAt item)
-                      (alist-get 'updatedAt item)))
+         (created (or (alist-get 'updatedAt item)
+                      (gethash id emacs-dsh--created-at)
+                      (alist-get 'createdAt item)))
          (date (if (numberp created)
                    (format-time-string "%Y-%m-%d %H:%M"
                                        (seconds-to-time (/ created 1000.0)))
                  "unknown")))
-    (concat date "  " (format "%-14s" short-id) "  "
-            (format "%-24s" workspace) "  "
+    (concat date "  " (format "%-18s" short-id) "  "
+            (format "%-32s" workspace) "  "
             (truncate-string-to-width clean prompt-width nil nil "…"))))
 
 (defun emacs-dsh--model-candidates (catalog)
