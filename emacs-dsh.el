@@ -702,7 +702,7 @@ An existing but invalid bridge must fail validation, not silently fall back."
                           "model: loading")
                         (if (and (stringp emacs-dsh--permission)
                                  (not (string-empty-p emacs-dsh--permission)))
-                            (format " • permission: %s" emacs-dsh--permission) ""))))
+                            (format " • %s" emacs-dsh--permission) ""))))
     (concat left " " (propertize " " 'display `(space :align-to (- right ,(string-width right))))
             (replace-regexp-in-string "%" "%%" right))))
 

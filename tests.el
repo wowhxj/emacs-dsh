@@ -1286,15 +1286,15 @@
      '((type . "baseline")
        (value . ((projections . ((s1 . ((asOfSeq . 1)
                                        (values . ((permissions . ((currentValue . "auto")))))))))))))
-    (should (string-match-p "permission: auto" (emacs-dsh--header)))
+    (should (string-match-p "• auto" (emacs-dsh--header)))
     (emacs-dsh--control-item
      '((type . "projection") (sessionId . "s1") (key . "permissions")
        (value . ((currentValue . "workspace-write")))))
-    (should (string-match-p "permission: workspace-write" (emacs-dsh--header)))
+    (should (string-match-p "• workspace-write" (emacs-dsh--header)))
     (emacs-dsh--control-item
      '((type . "projection") (sessionId . "other") (key . "permissions")
        (value . ((currentValue . "read-only")))))
-    (should (string-match-p "permission: workspace-write" (emacs-dsh--header)))))
+    (should (string-match-p "• workspace-write" (emacs-dsh--header)))))
 
 (ert-deftest emacs-dsh-queue-update-wire-shape ()
   (with-temp-buffer
@@ -1823,7 +1823,7 @@
        '((type . "item") (streamId . "s1")
          (value . ((type . "snapshot") (cursor . 0)
                    (projections . ((values . ((permissions . ((currentValue . "auto")))))))))))))
-    (should (string-match-p "permission: auto" (emacs-dsh--header)))))
+    (should (string-match-p "• auto" (emacs-dsh--header)))))
 
 (ert-deftest emacs-dsh-latest-prompt-is-pinned-below-status ()
   (with-temp-buffer
