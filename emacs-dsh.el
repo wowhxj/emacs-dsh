@@ -1835,15 +1835,16 @@ CHOOSE-MODE asks for an agent preset only if a new session is selected."
                          (mapcar (lambda (item)
                                    (cons (emacs-dsh--session-choice-label item)
                                          item))
-                                 (emacs-dsh--session-sort-newest items))
+                                 items)
                          (list (cons new-label :new)))))
            (emacs-dsh--defer-picker
             (lambda ()
               (let ((choice
                      (cdr (assoc
-                           (completing-read
-                            "Session in this directory (choose or create): "
-                            choices nil t)
+                           (let ((vertico-sort-function nil))
+                             (completing-read
+                              "Session in this directory (choose or create): "
+                              choices nil t))
                            choices))))
                 (cond
                  ((eq choice :new)
@@ -2053,9 +2054,10 @@ actual creation time.  Read all missing snapshots over one temporary socket."
     (emacs-dsh--defer-picker
      (lambda ()
        (when-let* ((choice (cdr (assoc
-                                  (completing-read
-                                   "Resume DSH (time | session ID | workspace | prompt): "
-                                   choices nil t)
+                                  (let ((vertico-sort-function nil))
+                                     (completing-read
+                                      "Resume DSH (time | session ID | workspace | prompt): "
+                                      choices nil t))
                                   choices))))
          (let ((source (current-buffer))
                (id (alist-get 'sessionId choice)))
@@ -2081,24 +2083,42 @@ actual creation time.  Read all missing snapshots over one temporary socket."
                  (when (derived-mode-p 'emacs-dsh-chat-mode)
                    (kill-buffer source)))))))))))
 
+(defun emacs-dsh--session-time (item)
+  "Return ITEM's last-activity time in seconds, or zero if unavailable."
+  (let ((time (or (alist-get 'updatedAt item)
+                  (alist-get 'createdAt item))))
+    (let ((seconds
+           (cond ((numberp time) time)
+                 ((and (stringp time)
+                       (string-match-p "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\'" time))
+                  (string-to-number time))
+                 ((stringp time)
+                  (condition-case nil
+                      (float-time (date-to-time time))
+                    (error 0)))
+                 (t 0))))
+      (if (> seconds 100000000000) (/ seconds 1000.0) seconds))))
+
 (defun emacs-dsh--session-sort-newest (items)
   "Return ITEMS sorted by most recent activity, newest first."
   (sort (copy-sequence items)
         (lambda (a b)
-          (> (or (alist-get 'updatedAt a) (alist-get 'createdAt a) 0)
-             (or (alist-get 'updatedAt b) (alist-get 'createdAt b) 0)))))
+          (> (emacs-dsh--session-time a)
+             (emacs-dsh--session-time b)))))
 
 (defun emacs-dsh--middle-truncate (string width)
   "Truncate STRING to WIDTH columns, preserving its beginning and end."
-  (if (<= (string-width string) width)
-      string
-    (let* ((content-width (max 2 (1- width)))
-           (head-width (/ (+ content-width 1) 2))
-           (tail-width (- content-width head-width))
-           (tail-start (- (string-width string) tail-width)))
-      (concat (truncate-string-to-width string head-width)
-              "…"
-              (truncate-string-to-width string tail-width tail-start)))))
+  (let* ((string (or string ""))
+         (total (string-width string)))
+    (if (<= total width)
+        string
+      (let* ((content-width (max 2 (1- width)))
+             (head-width (/ (+ content-width 1) 2))
+             (tail-width (- content-width head-width))
+             (tail-start (- total tail-width)))
+        (concat (truncate-string-to-width string head-width)
+                "…"
+                (truncate-string-to-width string tail-width nil tail-start))))))
 
 (defun emacs-dsh--session-choice-label (item &optional _id-width _workspace-width)
   "Format ITEM as date, shortened ID, directory, and prompt preview.
@@ -2119,12 +2139,14 @@ the identifying beginning and end of IDs and paths."
          (workspace (emacs-dsh--middle-truncate (emacs-dsh--workspace-label item)
                                                 32))
          (prompt-width (max 12 (min 76 (- (window-body-width) 48))))
-         (created (or (alist-get 'updatedAt item)
-                      (gethash id emacs-dsh--created-at)
-                      (alist-get 'createdAt item)))
-         (date (if (numberp created)
+         (activity-time (emacs-dsh--session-time item))
+         (created (if (> activity-time 0)
+                      activity-time
+                    (let ((cached (gethash id emacs-dsh--created-at)))
+                      (if (numberp cached) (/ cached 1000.0) 0)))
+         (date (if (> created 0)
                    (format-time-string "%Y-%m-%d %H:%M"
-                                       (seconds-to-time (/ created 1000.0)))
+                                       (seconds-to-time created))
                  "unknown")))
     (concat date "  " (format "%-18s" short-id) "  "
             (format "%-32s" workspace) "  "

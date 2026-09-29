@@ -1063,10 +1063,13 @@
 (ert-deftest emacs-dsh-session-sort-newest-orders-by-last-activity ()
   (should (equal (mapcar (lambda (item) (alist-get 'sessionId item))
                          (emacs-dsh--session-sort-newest
-                          '(((sessionId . "old") (updatedAt . 10))
-                            ((sessionId . "new") (updatedAt . 30))
-                            ((sessionId . "middle") (updatedAt . 20)))))
+                          '(((sessionId . "old") (updatedAt . 1000000000000))
+                            ((sessionId . "new") (updatedAt . 3000000000000))
+                            ((sessionId . "middle") (updatedAt . 2000000000000)))))
                  '("new" "middle" "old"))))
+
+(ert-deftest emacs-dsh-middle-truncate-preserves-prefix-and-suffix ()
+  (should (equal (emacs-dsh--middle-truncate "abcdefghij" 7) "abc…hij")))
 
 (ert-deftest emacs-dsh-session-choice-label-bounds-long-columns ()
   (let ((emacs-dsh--created-at (make-hash-table :test #'equal)))
