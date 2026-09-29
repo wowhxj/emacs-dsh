@@ -323,6 +323,12 @@
                   #'emacs-dsh-toggle-process))
       (should-not (string-match-p "You: question" hidden))
       (should-not (string-match-p "DSH: answer" hidden))
+      ;; Redisplay draws `display' before honouring `invisible'; the hidden
+      ;; run must not start on a step header or swallow the reply's newline.
+      (should (eq (char-after (overlay-start body)) ?\n))
+      (should-not (cl-some (lambda (ov) (overlay-get ov 'display))
+                           (overlays-at (overlay-start body))))
+      (should (string-suffix-p "\n" (overlay-get header 'display)))
       (should (< (save-excursion (goto-char (point-min)) (search-forward "You: question"))
                  (overlay-start header)))
       (goto-char (overlay-start header))
@@ -1564,14 +1570,20 @@
       (should (equal created "code")))))
 
 (ert-deftest emacs-dsh-chat-offers-sessions-for-selected-directory ()
-  (let ((shown nil) (created nil) (chosen nil))
+  (let ((shown nil) (created nil) (chosen nil) (archived nil))
     (cl-letf (((symbol-function 'emacs-dsh--call)
-               (lambda (endpoint _args success &optional _error)
-                 (should (equal endpoint "session/list"))
-                 (funcall success
-                          '((items . (((sessionId . "same-dir") (cwd . "/tmp/"))
-                                      ((sessionId . "workspace-cwd") (cwd . "/tmp"))
-                                      ((sessionId . "other-dir") (cwd . "/elsewhere/"))))))))
+               (lambda (endpoint args success &optional _error)
+                 (pcase endpoint
+                   ("workspace/archiveSession"
+                    (push (alist-get 'sessionId (alist-get 'request args)) archived)
+                    (funcall success nil))
+                   ("session/list"
+                    (funcall success
+                             '((items . (((sessionId . "same-dir") (cwd . "/tmp/"))
+                                         ((sessionId . "workspace-cwd") (cwd . "/tmp"))
+                                         ((sessionId . "empty") (cwd . "/tmp/")
+                                          (blank . t) (running))
+                                         ((sessionId . "other-dir") (cwd . "/elsewhere/"))))))))))
               ((symbol-function 'emacs-dsh--local-path) #'identity)
               ((symbol-function 'emacs-dsh--defer-picker)
                (lambda (callback) (funcall callback)))
@@ -1586,8 +1598,37 @@
       (emacs-dsh-chat "/tmp/" nil))
     (should (equal shown '("same-dir" "/tmp/")))
     (should-not created)
+    (should (equal archived '("empty")))
     (should (= (length chosen) 3))
     (should (string-match-p "New session" (nth 2 chosen)))))
+
+(ert-deftest emacs-dsh-user-face-spans-full-line ()
+  (should (eq (face-attribute 'emacs-dsh-user-face :extend nil t) t)))
+
+(ert-deftest emacs-dsh-history-image-attachment-renders ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (setq-local emacs-dsh--session-id "s1")
+    (emacs-dsh--compose)
+    (let (requested)
+      (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) t))
+                ((symbol-function 'emacs-dsh--call)
+                 (lambda (endpoint args success &optional _error)
+                   (should (equal endpoint "session/attachment"))
+                   (setq requested (alist-get 'request args))
+                   (funcall success
+                            '((attachment . ((mediaType . "image/png")))
+                              (data . "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="))))))
+        (emacs-dsh--event
+         '((type . "user/message") (seq . 1)
+           (data . ((content . (((type . "text") (text . "see"))
+                                ((type . "image")
+                                 (attachment . ((attachmentId . "sha256:abc")
+                                                (mediaType . "image/png")))))))))))
+      (should (equal requested '((sessionId . "s1") (attachmentId . "sha256:abc"))))
+      (goto-char (point-min))
+      (search-forward "[image]")
+      (should (eq (car-safe (get-text-property (match-beginning 0) 'display)) 'image)))))
 
 (ert-deftest emacs-dsh-mode-choices-and-blank-selection ()
   (should (equal (emacs-dsh--preset-choices

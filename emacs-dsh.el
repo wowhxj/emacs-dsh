@@ -31,10 +31,13 @@
   '((t :inherit mode-line))
   "Face for the DSH mode-line status." :group 'emacs-dsh)
 (defface emacs-dsh-user-face
-  '((((class color) (background light)) :background "#edf5f4" :foreground "#244b48")
-    (((class color) (background dark)) :background "#263b3b" :foreground "#d9ebe8")
-    (t :inherit default))
-  "Face for user messages." :group 'emacs-dsh)
+  '((((class color) (background light))
+     :inherit warning :weight normal :background "#fdf1dc" :extend t)
+    (((class color) (background dark))
+     :inherit warning :weight normal :background "#3b3020" :extend t)
+    (t :inherit warning :extend t))
+  "Face for user messages; its background spans the full window width."
+  :group 'emacs-dsh)
 (defface emacs-dsh-assistant-label-face
   '((t :inherit font-lock-keyword-face :weight bold))
   "Face for the assistant label." :group 'emacs-dsh)
@@ -913,17 +916,45 @@ The original characters remain in the transcript for copying and search."
         (overlay-put overlay 'help-echo (concat "Open " url)))
       (setq offset (match-end 0)))))
 
+(defun emacs-dsh--decode-image (mime data)
+  "Return an Emacs image from base64 DATA of MIME type, or nil."
+  (let ((type (cdr (assoc mime '(("image/png" . png) ("image/jpeg" . jpeg)
+                                 ("image/webp" . webp) ("image/gif" . gif))))))
+    (and (display-images-p) type (stringp data)
+         (ignore-errors
+           (create-image (base64-decode-string data) type t
+                         :max-width 480 :max-height 320)))))
+
 (defun emacs-dsh--image-block (block)
-  "Render a user image BLOCK, falling back to its label without pixels."
-  (let* ((mime (alist-get 'mediaType block))
-         (type (cdr (assoc mime '(("image/png" . png) ("image/jpeg" . jpeg)
-                                  ("image/webp" . webp) ("image/gif" . gif)))))
-         (data (alist-get 'data block))
-         (image (and (display-images-p) type (stringp data)
-                     (ignore-errors
-                       (create-image (base64-decode-string data) type t
-                                     :max-width 480 :max-height 320)))))
-    (if image (propertize "[image]" 'display image) "[image]")))
+  "Render a user image BLOCK, falling back to its label without pixels.
+History blocks only reference an attachment; mark those for loading."
+  (let ((image (emacs-dsh--decode-image (alist-get 'mediaType block)
+                                        (alist-get 'data block)))
+        (attachment (alist-get 'attachmentId (alist-get 'attachment block))))
+    (cond (image (propertize "[image]" 'display image))
+          ((and attachment (display-images-p))
+           (propertize "[image]" 'emacs-dsh-attachment attachment))
+          (t "[image]"))))
+
+(defun emacs-dsh--load-attachments (start end)
+  "Fetch images for attachment placeholders between START and END."
+  (let ((pos start))
+    (while (setq pos (text-property-not-all pos end 'emacs-dsh-attachment nil))
+      (let* ((next (next-single-property-change pos 'emacs-dsh-attachment nil end))
+             (id (get-text-property pos 'emacs-dsh-attachment))
+             (marker (copy-marker pos)))
+        (emacs-dsh--call
+         "session/attachment"
+         `((request . ((sessionId . ,emacs-dsh--session-id) (attachmentId . ,id))))
+         (lambda (value)
+           (when-let* ((image (emacs-dsh--decode-image
+                               (alist-get 'mediaType (alist-get 'attachment value))
+                               (alist-get 'data value))))
+             (let ((inhibit-read-only t))
+               (put-text-property marker (+ marker (length "[image]")) 'display image)))
+           (set-marker marker nil))
+         (lambda (_failure) (set-marker marker nil)))
+        (setq pos next)))))
 
 (defvar emacs-dsh--process-map
   (let ((map (make-sparse-keymap)))
@@ -941,8 +972,10 @@ The original characters remain in the transcript for copying and search."
           (t (format "%dh %dm" (/ seconds 3600) (/ (% seconds 3600) 60))))))
 
 (defun emacs-dsh--process-heading (label expanded)
-  "Return the folded process heading for LABEL, EXPANDED or not."
-  (propertize (concat (if expanded "▾ " "▸ ") label) 'face 'shadow))
+  "Return the folded process heading for LABEL, EXPANDED or not.
+While collapsed the heading's own newline is hidden, so it supplies one."
+  (propertize (concat (if expanded "▾ " "▸ ") label (unless expanded "\n"))
+              'face 'shadow))
 
 (defun emacs-dsh--fold-process (&optional end-time)
   "Collapse the intermediate transcript for the current finished turn.
@@ -965,11 +998,16 @@ END-TIME is the Host time in ms of `turn/end', used for the total duration."
       (save-excursion
         (goto-char emacs-dsh--turn-start)
         (let ((heading (point)))
-          (insert (emacs-dsh--process-heading label nil) "\n")
+          (insert (propertize (concat "▸ " label) 'face 'shadow) "\n")
           (add-text-properties heading (point)
                                '(read-only t rear-nonsticky (read-only)))
+          ;; Redisplay applies `display' before `invisible' at a stop position,
+          ;; so a body starting on a step header would still draw that header.
+          ;; Start on the heading's plain newline instead.
           (let ((header (make-overlay heading (1- (point)) nil t nil))
-                (body (make-overlay (point) emacs-dsh--final-start nil nil nil)))
+                (body (make-overlay (1- (point)) emacs-dsh--final-start
+                                    nil nil nil)))
+            (overlay-put header 'display (emacs-dsh--process-heading label nil))
             (overlay-put header 'emacs-dsh-process body)
             (overlay-put header 'emacs-dsh-process-label label)
             (overlay-put header 'keymap emacs-dsh--process-map)
@@ -1026,7 +1064,8 @@ Assistant TEXT is rendered as Markdown; USER CONTENT may contain images."
           (insert formatted "\n")
           (add-text-properties start (point) '(read-only t
                                                rear-nonsticky (read-only)))
-          (unless user
+          (if user
+              (emacs-dsh--load-attachments start (point))
             (emacs-dsh--linkify-markdown text (+ start (length label)))))))))
 
 (cl-defstruct (emacs-dsh--tool-card
@@ -1879,38 +1918,44 @@ CHOOSE-MODE asks for an agent preset only if a new session is selected."
   (emacs-dsh--call
    "session/list" `((_request . ,(make-hash-table)))
    (lambda (value)
-     (let* ((local-root (expand-file-name root))
-            (items (emacs-dsh--session-sort-newest
-                    (cl-remove-if-not
-                     (lambda (item)
-                       (let* ((cwd (alist-get 'cwd item))
-                              (local-cwd (and cwd (emacs-dsh--local-path cwd))))
-                         ;; Workspace cwds are realpaths without a trailing slash.
-                         (and local-cwd (file-equal-p local-root local-cwd))))
-                     (alist-get 'items value))))
-            (new-label "[New session] "))
-       (if (null items)
-           (emacs-dsh--create-session-with-choice root choose-mode)
-         (let ((choices (append
-                         (mapcar (lambda (item)
-                                   (cons (emacs-dsh--session-choice-label item)
-                                         item))
-                                 items)
-                         (list (cons new-label :new)))))
-           (emacs-dsh--defer-picker
-            (lambda ()
-              (let ((choice
-                     (cdr (assoc
-                           (let ((vertico-sort-function nil))
-                             (completing-read
-                              "Session in this directory (choose or create): "
-                              choices nil t))
-                           choices))))
-                (cond
-                 ((eq choice :new)
-                  (emacs-dsh--create-session-with-choice root choose-mode))
-                 (choice
-                  (emacs-dsh--show (alist-get 'sessionId choice) root))))))))))))
+     (emacs-dsh--archive-empty-sessions
+      (let ((local-root (expand-file-name root)))
+        (cl-remove-if-not
+         (lambda (item)
+           (let* ((cwd (alist-get 'cwd item))
+                  (local-cwd (and cwd (emacs-dsh--local-path cwd))))
+             ;; Workspace cwds are realpaths without a trailing slash.
+             (and local-cwd (file-equal-p local-root local-cwd))))
+         (alist-get 'items value)))
+      (lambda (survivors)
+        (emacs-dsh--offer-root-sessions
+         (emacs-dsh--session-sort-newest survivors) root choose-mode))))))
+
+(defun emacs-dsh--offer-root-sessions (items root choose-mode)
+  "Pick one of ROOT's session ITEMS or create a new one with CHOOSE-MODE."
+  (let ((new-label "[New session] "))
+    (if (null items)
+        (emacs-dsh--create-session-with-choice root choose-mode)
+      (let ((choices (append
+                      (mapcar (lambda (item)
+                                (cons (emacs-dsh--session-choice-label item)
+                                      item))
+                              items)
+                      (list (cons new-label :new)))))
+        (emacs-dsh--defer-picker
+         (lambda ()
+           (let ((choice
+                  (cdr (assoc
+                        (let ((vertico-sort-function nil))
+                          (completing-read
+                           "Session in this directory (choose or create): "
+                           choices nil t))
+                        choices))))
+             (cond
+              ((eq choice :new)
+               (emacs-dsh--create-session-with-choice root choose-mode))
+              (choice
+               (emacs-dsh--show (alist-get 'sessionId choice) root))))))))))
 
 (defun emacs-dsh--create-session-with-choice (root choose-mode)
   "Create a new DSH session in ROOT, optionally prompting for a preset."
