@@ -1053,12 +1053,25 @@
                   (projections (values
                                 (title . "Generated title")
                                 (turnOutline ((prompt . "First request\ncontinued"))))))
-                12)))
+                )))
       (should (string-match-p "First request continued" label))
       (should (string-match-p "^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] " label))
       (should (= (string-match "First request" label)
-                 (+ 18 12 2 (string-width "/tmp/project") 2)))
+                 60))
       (should (string-match-p "/tmp/project" label)))))
+
+(ert-deftest emacs-dsh-session-choice-label-bounds-long-columns ()
+  (let ((emacs-dsh--created-at (make-hash-table :test #'equal)))
+    (cl-letf (((symbol-function 'emacs-dsh--workspace-label)
+               (lambda (_item) "/private/tmp/very/long/scratch/path/that/should/not/dominate")))
+      (let ((label (emacs-dsh--session-choice-label
+                    '((sessionId . "session-12345678-1234-1234-1234-123456789abc")
+                      (projections (values
+                                    (turnOutline ((prompt . "Find my prompt")))))))))
+        (should (string-match-p "session-12345…" label))
+        (should (string-match-p "/private/tmp/very/lo…" label))
+        (should (string-match-p "Find my prompt" label))
+        (should (< (string-width label) 100))))))
 
 (ert-deftest emacs-dsh-resume-reads-creation-time-from-snapshot ()
   (let ((emacs-dsh--created-at (make-hash-table :test #'equal))

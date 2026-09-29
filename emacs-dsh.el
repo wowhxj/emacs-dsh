@@ -2043,18 +2043,11 @@ actual creation time.  Read all missing snapshots over one temporary socket."
       "(unknown)")))
 
 (defun emacs-dsh--resume-picker (items)
-  "Show all visible sessions with aligned time, ID, workspace, and preview."
-  (let* ((id-width (apply #'max (mapcar (lambda (item)
-                                         (string-width (alist-get 'sessionId item)))
-                                       items)))
-         (workspace-width (apply #'max (mapcar (lambda (item)
-                                                (string-width (emacs-dsh--workspace-label item)))
-                                              items)))
-         (choices (mapcar (lambda (item)
-                            (cons (emacs-dsh--session-choice-label
-                                   item id-width workspace-width)
-                                  item))
-                          items)))
+  "Show sessions with compact ID and directory columns and a useful prompt."
+  (let ((choices (mapcar (lambda (item)
+                           (cons (emacs-dsh--session-choice-label item)
+                                 item))
+                         items)))
     (emacs-dsh--defer-picker
      (lambda ()
        (when-let* ((choice (cdr (assoc
@@ -2086,8 +2079,11 @@ actual creation time.  Read all missing snapshots over one temporary socket."
                  (when (derived-mode-p 'emacs-dsh-chat-mode)
                    (kill-buffer source)))))))))))
 
-(defun emacs-dsh--session-choice-label (item &optional id-width workspace-width)
-  "Format ITEM as aligned time, ID, workspace, and first prompt columns."
+(defun emacs-dsh--session-choice-label (item &optional _id-width _workspace-width)
+  "Format ITEM as date, short ID, directory, and prompt preview.
+
+The completion UI adapts to the current window width; fixed caps keep IDs
+and long temporary paths from pushing the identifying prompt off-screen."
   (let* ((values (alist-get 'values (alist-get 'projections item)))
          (outline (alist-get 'turnOutline values))
          (first-prompt (and outline (alist-get 'prompt (car outline))))
@@ -2098,7 +2094,10 @@ actual creation time.  Read all missing snapshots over one temporary socket."
                         (t "(empty session)")))
          (clean (replace-regexp-in-string "[[:space:]\n\r]+" " " preview))
          (id (alist-get 'sessionId item))
-         (workspace (emacs-dsh--workspace-label item))
+         (short-id (truncate-string-to-width id 14 nil nil "…"))
+         (workspace (truncate-string-to-width (emacs-dsh--workspace-label item)
+                                              24 nil nil "…"))
+         (prompt-width (max 12 (min 76 (- (window-body-width) 48))))
          (created (or (gethash id emacs-dsh--created-at)
                       (alist-get 'createdAt item)
                       (alist-get 'updatedAt item)))
@@ -2106,13 +2105,9 @@ actual creation time.  Read all missing snapshots over one temporary socket."
                    (format-time-string "%Y-%m-%d %H:%M"
                                        (seconds-to-time (/ created 1000.0)))
                  "unknown")))
-    (concat (format "%-16s  " date)
-            id (make-string (max 0 (- (or id-width (string-width id))
-                                      (string-width id))) ?\s)
-            "  " workspace
-            (make-string (max 0 (- (or workspace-width (string-width workspace))
-                                   (string-width workspace))) ?\s)
-            "  " (truncate-string-to-width clean 76 nil nil "…"))))
+    (concat date "  " (format "%-14s" short-id) "  "
+            (format "%-24s" workspace) "  "
+            (truncate-string-to-width clean prompt-width nil nil "…"))))
 
 (defun emacs-dsh--model-candidates (catalog)
   "Return completion entries for the routable models in CATALOG."
