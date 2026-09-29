@@ -72,9 +72,9 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 
 输入框底色只作视觉填充，不在草稿中添加补齐空格；`C-e` 可直接到当前输入行末。
 
-顶部第一行显示上下文 token 使用量（Host 提供时）、模型、推理程度、Agent 模式和 Host 当前的权限预设（例如 `permission: auto`）；修改权限时会更新，恢复会话时会读取当前值。第二行固定显示当前执行任务（或最近完成任务）对应的 prompt，提交或编辑排队消息不会取代它；长 prompt 会截断以保持单行，聊天记录滚动时仍可见。收到最终回复后，本轮工具调用等中间过程自动折叠为 `Process`，把光标放在标题上按 `RET` 或点击可展开／再次折叠。新建会话默认选择 `auto` 权限（Host 未提供时使用 `danger-full-access`），可通过 `emacs-dsh-default-permission` 自定义；Emacs 原有 mode-line 的聊天 buffer 名显示工作目录（同名目录的多个会话会自动编号），并追加 DSH 空闲/思考/工具执行/等待操作的动态状态及队列数量（`Q` 为待发送、`S` 为 steer）。最近一条用户 query 保留在聊天记录中。新会话会自动读取 Host 默认模型。`/model` 可选择模型，`/reasoning` 可选择当前模型支持的思考程度。`/help` 显示客户端命令及 Host 提供的命令；其他 Host 命令由 `commands/list` 发现并交给 Host 执行。已注册的 `/skill-name` 作为 prompt 提交。
+顶部第一行显示上下文 token 使用量（Host 提供时）、模型、推理程度、Agent 模式和 Host 当前的权限预设（例如 `permission: auto`）；修改权限时会更新，恢复会话时会读取当前值。第二行固定显示当前执行任务（或最近完成任务）对应的 prompt，提交或编辑排队消息不会取代它；长 prompt 会截断以保持单行，聊天记录滚动时仍可见。本轮结束后，中间步骤自动折叠为一行 `Process`，显示总耗时和步骤数（例如 `▸ Process · 8m 37s · 12 steps`），最终回复紧随其后；未产生回复就出错的轮次也会同样折叠。用户输入的 prompt 始终不参与折叠。把光标放在标题上按 `RET`、`TAB` 或点击可展开／再次折叠。新建会话默认选择 `auto` 权限（Host 未提供时使用 `danger-full-access`），可通过 `emacs-dsh-default-permission` 自定义；Emacs 原有 mode-line 的聊天 buffer 名显示工作目录（同名目录的多个会话会自动编号），并追加 DSH 空闲/思考/工具执行/等待操作的动态状态及队列数量（`Q` 为待发送、`S` 为 steer）。最近一条用户 query 保留在聊天记录中。新会话会自动读取 Host 默认模型。`/model` 可选择模型，`/reasoning` 可选择当前模型支持的思考程度。`/help` 显示客户端命令及 Host 提供的命令；其他 Host 命令由 `commands/list` 发现并交给 Host 执行。已注册的 `/skill-name` 作为 prompt 提交。
 
-助手回复使用 `markdown-mode` 的 Emacs 原生样式显示标题、强调、代码和链接，并隐藏部分 Markdown 标记；buffer 中仍保留原文，复制和搜索得到的是原始 Markdown。HTTP(S) 链接可用 `RET` 或鼠标点击打开。流式回复先以轻量文本显示，消息完成后再排版。工具调用显示为带状态和参数摘要的卡片：`●` 运行中、`✓` 成功、`✗` 失败；把光标移到卡片标题后按 `RET` 或点击，可展开/收起完整参数和结果。
+助手回复使用 `markdown-mode` 的 Emacs 原生样式显示标题、强调、代码和链接，并隐藏部分 Markdown 标记；buffer 中仍保留原文，复制和搜索得到的是原始 Markdown。HTTP(S) 链接可用 `RET` 或鼠标点击打开。流式回复先以轻量文本显示，消息完成后再排版。任务执行中的每个步骤显示为默认折叠的一行：工具调用带状态和参数摘要（`●` 运行中、`✓` 成功、`✗` 失败），推理显示为带标题的 `✻ Thinking`（将 `emacs-dsh-show-reasoning` 设为 nil 可隐藏）；把光标移到步骤上按 `RET`、`TAB` 或点击，可展开/收起完整参数、结果或推理内容。
 
 输入 `@` 后按 `TAB` 可从 Host 文件和其他会话中选择引用。Host 没有文件候选时，会从当前工作目录就地补全文件和子目录；显式输入 `@~/` 或绝对路径时，还可补全项目外的本机目录。跨会话引用直接插入 Host 返回的 `@[标题](dsh-session:…)` 文本。`M-x emacs-dsh-insert-file` 可手动插入文件引用，`M-x emacs-dsh-attach-image` 可暂存图片；待发送图片显示在输入框上方，图形界面显示缩略图，点击预览即可移除。智能粘贴在 WSL 读取 Windows 剪贴板，在 macOS 读取本机剪贴板。
 
