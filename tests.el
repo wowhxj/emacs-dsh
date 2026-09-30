@@ -205,19 +205,7 @@
                         (data . ((reason . ((kind . "completed")))))))
     (should-not (string-match-p "▸ Process" (buffer-string)))
     (should-not (string-match-p "\\[turn" (buffer-string)))
-    (goto-char (point-min))
-    (let ((rule (text-property-any (point-min) (point-max)
-                                   'face 'emacs-dsh-turn-separator-face)))
-      (should rule)
-      (should (eq (char-after rule) ?─))
-      ;; The face must end with the rule's own newline: a following blank
-      ;; line carrying it shows as a stray struck-through dash in GUI frames.
-      (let ((end (next-single-property-change rule 'face nil (point-max))))
-        (should (eq (char-before end) ?\n))
-        (should (eq (char-before (1- end)) ?─))))
-    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t)))
-      (should (equal (get-text-property 0 'display (emacs-dsh--turn-rule))
-                     '(space :align-to right))))))
+    (should-not (string-match-p "─" (buffer-string)))))
 
 (ert-deftest emacs-dsh-process-fold-keeps-last-assistant-message ()
   (with-temp-buffer

@@ -2,6 +2,8 @@
 
 核对日期：2026-09-30。参考本机 emacs-pi 0.3.4 的实现，以及项目聊天「规划 Emacs Pi Agent 插件」的全部可访问用户消息（2026-09-29）。本机 Codex 活动和归档 session 检索只找到该项目这一份对话；未发现同目录的 Claude Code 项目记录。后续修正优先，例如 warning 高亮只用于历史，不用于输入区，图片查看使用系统默认程序。
 
+2026-09-30 后续调整：历史用户消息已有 warning 整行高亮，移除回合之间的横向分隔线，保留普通留白。
+
 参考源码：emacs-pi-ui.el、emacs-pi-input.el、emacs-pi-queue.el、emacs-pi-history.el、emacs-pi.el，并核对 README、CHANGELOG、docs/DESIGN.md、docs/QUEUE.md 和验收文档。emacs-pi 原先从 emacs-dsh 迁移了不少 UI，本次将其中后续改进同步回 DSH，保留各自后端。
 
 ## 逐项需求对应
