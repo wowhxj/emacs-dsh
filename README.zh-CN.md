@@ -63,22 +63,24 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 | `RET` 或 `C-c C-c` | 发送输入 |
 | `Shift-Enter` | 在输入框插入换行，不发送 |
 | `C-c C-s` / `C-c C-k` | 运行中 steer / 取消轮次 |
-| `C-c C-l` 或 `/queue` | 查看待发送与 steer 消息，在聊天输入框编辑纯文本消息，也可删除消息或转为 steer |
+| `C-c C-l` 或 `/queue` | 打开独立队列窗口，编辑、删除或转为 steer，`C-c C-c` 应用 |
 | `C-c C-q` | 关闭 Emacs 聊天 buffer，不删除 Host 会话 |
 | `/mode` 或 `M-x emacs-dsh-select-mode` | 为**尚未开始对话**的会话选择模式（Standard、PTC、Minimal、Creator，按 Host 实际可用模式显示） |
 | `M-x emacs-dsh-permission` 或 `/permission <预设>` | 为当前会话选择权限：仅查看、工作区修改、完全权限；Host 提供时还可选 Auto review（值为 `auto`） |
 | `TAB` | 补全 `/` 命令、技能、`@` 项目文件／会话引用；输入 `@~/sandbox/` 或 `@/absolute/path/` 时可补全项目外任意目录中的文件和文件夹 |
+| `C-c C-i` / `C-c C-b` | 聚焦输入区 / 切换活动聊天 |
+| `C-c C-o` | 用系统默认图片查看器打开光标处的历史图片或待发送附件 |
 | `C-c C-p`、`s-v` 或 `s-V` | 智能粘贴文本、文件引用或图片 |
 
 输入框底色只作视觉填充，不在草稿中添加补齐空格；`C-e` 可直接到当前输入行末。
 
-顶部第一行显示上下文 token 使用量（Host 提供时）、模型、推理程度、Agent 模式和 Host 当前的权限预设（例如 `permission: auto`）；修改权限时会更新，恢复会话时会读取当前值。第二行固定显示当前执行任务（或最近完成任务）对应的 prompt，提交或编辑排队消息不会取代它；长 prompt 会截断以保持单行，聊天记录滚动时仍可见。本轮结束后，中间步骤自动折叠为一行 `Process`，显示总耗时和步骤数（例如 `▸ Process · 8m 37s · 12 steps`），最终回复紧随其后；未产生回复就出错的轮次也会同样折叠。用户输入的 prompt 始终不参与折叠。把光标放在标题上按 `RET`、`TAB` 或点击可展开／再次折叠。新建会话默认选择 `auto` 权限（Host 未提供时使用 `danger-full-access`），可通过 `emacs-dsh-default-permission` 自定义；Emacs 原有 mode-line 的聊天 buffer 名显示工作目录（同名目录的多个会话会自动编号），并追加 DSH 空闲/思考/工具执行/等待操作的动态状态及队列数量（`Q` 为待发送、`S` 为 steer）。最近一条用户 query 保留在聊天记录中。新会话会自动读取 Host 默认模型。`/model` 可选择模型，`/reasoning` 可选择当前模型支持的思考程度。`/help` 显示客户端命令及 Host 提供的命令；其他 Host 命令由 `commands/list` 发现并交给 Host 执行。已注册的 `/skill-name` 作为 prompt 提交。
+顶部第一行显示上下文 token 使用量（Host 提供时）、模型、推理程度、Agent 模式和 Host 当前的权限预设（例如 `auto`）；修改权限时会更新，恢复会话时会读取当前值。第二行固定显示当前执行任务（或最近完成任务）对应的 prompt，提交或编辑排队消息不会取代它；长 prompt 会截断以保持单行，聊天记录滚动时仍可见。运行时顶层 `Process` 默认展开，工具和 Thinking 详情保持折叠，手动切换会保留；本轮结束后整体和详情重新收起，中间步骤自动折叠为一行 `Process`，显示总耗时和步骤数（例如 `▸ Process · 8m 37s · 12 steps`），最终回复紧随其后；未产生回复就出错的轮次也会同样折叠。用户输入的 prompt 始终不参与折叠。把光标放在标题上按 `RET`、`TAB` 或点击可展开／再次折叠。新建会话默认选择 `auto` 权限（Host 未提供时使用 `danger-full-access`），可通过 `emacs-dsh-default-permission` 自定义；Emacs 原有 mode-line 的聊天 buffer 名显示工作目录（同名目录的多个会话会自动编号），并追加 DSH 空闲/思考/工具执行/等待操作的动态状态及队列数量（`S` 为 steer、`F` 为 follow-up，例如 `[S1 F2]`）。最近一条用户 query 保留在聊天记录中。新会话会自动读取 Host 默认模型。`/model` 可选择模型，`/reasoning` 可选择当前模型支持的思考程度。`/help` 显示客户端命令及 Host 提供的命令；其他 Host 命令由 `commands/list` 发现并交给 Host 执行。已注册的 `/skill-name` 作为 prompt 提交。
 
 助手回复使用 `markdown-mode` 的 Emacs 原生样式显示标题、强调、代码和链接，并隐藏部分 Markdown 标记；buffer 中仍保留原文，复制和搜索得到的是原始 Markdown。HTTP(S) 链接可用 `RET` 或鼠标点击打开。流式回复先以轻量文本显示，消息完成后再排版。任务执行中的每个步骤显示为默认折叠的一行：工具调用带状态和参数摘要（`●` 运行中、`✓` 成功、`✗` 失败），推理显示为带标题的 `✻ Thinking`（将 `emacs-dsh-show-reasoning` 设为 nil 可隐藏）；把光标移到步骤上按 `RET`、`TAB` 或点击，可展开/收起完整参数、结果或推理内容。
 
 输入 `@` 后按 `TAB` 可从 Host 文件和其他会话中选择引用。Host 没有文件候选时，会从当前工作目录就地补全文件和子目录；显式输入 `@~/` 或绝对路径时，还可补全项目外的本机目录。跨会话引用直接插入 Host 返回的 `@[标题](dsh-session:…)` 文本。`M-x emacs-dsh-insert-file` 可手动插入文件引用，`M-x emacs-dsh-attach-image` 可暂存图片；待发送图片显示在输入框上方，图形界面显示缩略图，点击预览即可移除。智能粘贴在 WSL 读取 Windows 剪贴板，在 macOS 读取本机剪贴板。
 
-`C-c C-l`（或 `/queue`）列出当前会话尚未被 Host 消费的消息。选择「Edit」后，会在聊天主 buffer 的输入框中载入文字，而非在 minibuffer 编辑；按 `RET` 或 `C-c C-c` 保存，按 `C-c C-k` 取消并恢复原来的草稿和附件。与 DSH 桌面端一致，只有纯文本消息可以编辑：Host 会用文本整体替换被编辑的消息，因此带图片的消息不提供「Edit」，请删除后重新发送。也可删除整条消息，或将待发送消息转为本轮 steer；后者仅在 Agent 运行时有效。队列内容来自 Host 的 `session/control` → `inbox` 实时投影，网络断开重连后会重新读取队列快照。
+`C-c C-l`（或 `/queue`）打开独立队列窗口：在消息上按 `RET` 进入独立文本编辑 buffer，`C-c C-c` 暂存，`C-c C-k` 放弃；列表中 `d` 暂存删除、`s` 暂存转为 steer，最后按 `C-c C-c` 应用。`g` 放弃未应用修改并刷新，`q` 销毁队列和编辑 buffer，不影响聊天草稿。没有本地修改时，列表跟随 Host 的 inbox 投影自动更新；编辑期间队列已变化则拒绝应用，提示刷新。DSH 原生接口只支持编辑纯文本、删除和转为 steer，不支持排序、降回 follow-up 或编辑图片；图片消息可预览和查看，修改时需删除后重新发送。逐项操作可能部分成功，失败时保留剩余修改并明确提示，不自动重试。
 
 历史由 Host 保存。`/resume` 的 minibuffer 搜索覆盖 `session/list` 返回的全部可见会话，不逐个请求历史快照；进入会话后初次加载最近 `emacs-dsh-max-messages` 条消息，随后通过 WebSocket 接收实时事件并支持重连。旧**消息**分页尚未实现；Host 在消息内容中提供图片数据时，图形界面会显示图片，文字终端仍显示 `[image]`。
 
@@ -106,3 +108,7 @@ emacs -Q --batch -L /path/to/websocket-el -L /path/to/markdown-mode -L . -l emac
 Windows/WSL 的 Emacs 回归测试可运行；macOS 的剪贴板与路径有单元测试，队列和引用逻辑不依赖 WSL 路径工具。真实 Desktop Host 端到端行为仍需在 Mac 上验证。Host bridge 有自己的测试和发布流程。
 
 协议参考：[Session Controller](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/api/session-controller)、[Connection](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/client/connection)、[API Gateway](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/api/gateway)。
+
+## 与 emacs-pi 的交互一致性
+
+已按 emacs-pi 项目对话中的需求核对输入区、历史高亮、窗口、补全、折叠、队列和图片查看。完整对照和后端差异见 [UI 一致性记录](docs/UI-CONSISTENCY.md)。历史用户消息以当前主题 warning 颜色为整行背景，输入区沿用灰色 widget-field。打开聊天会占满当前 frame；`C-c C-q` 销毁聊天和相关队列 buffer。`@` 的 minibuffer 补全可随输入逐层进入目录，兼容 Vertico/Orderless 和原生补全，补全不会删除 token 后面的草稿。
