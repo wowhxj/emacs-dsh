@@ -67,7 +67,7 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 | `C-c C-q` | 关闭 Emacs 聊天 buffer，不删除 Host 会话 |
 | `/mode` 或 `M-x emacs-dsh-select-mode` | 为**尚未开始对话**的会话选择模式（Standard、PTC、Minimal、Creator，按 Host 实际可用模式显示） |
 | `M-x emacs-dsh-permission` 或 `/permission <预设>` | 为当前会话选择权限：仅查看、工作区修改、完全权限；Host 提供时还可选 Auto review（值为 `auto`） |
-| `TAB` | 补全 `/` 命令、技能、`@` 项目文件／会话引用；输入 `@~/sandbox/` 或 `@/absolute/path/` 时可补全项目外任意目录中的文件和文件夹 |
+| `TAB` | 补全 `/` 命令和技能；`@` 单独补全文件/目录，`@session` 单独补全会话引用；`@~/sandbox/` 和绝对路径也支持项目外目录 |
 | `C-c C-i` / `C-c C-b` | 聚焦输入区 / 切换活动聊天 |
 | `C-c C-o` | 用系统默认图片查看器打开光标处的历史图片或待发送附件 |
 | `C-c C-p`、`s-v` 或 `s-V` | 智能粘贴文本、文件引用或图片 |
@@ -76,9 +76,13 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 
 顶部第一行显示上下文 token 使用量（Host 提供时）、模型、推理程度、Agent 模式和 Host 当前的权限预设（例如 `auto`）；修改权限时会更新，恢复会话时会读取当前值。第二行固定显示当前执行任务（或最近完成任务）对应的 prompt，提交或编辑排队消息不会取代它；长 prompt 会截断以保持单行，聊天记录滚动时仍可见。运行时顶层 `Process` 默认展开，工具和 Thinking 详情保持折叠，手动切换会保留；本轮结束后整体和详情重新收起，中间步骤自动折叠为一行 `Process`，显示总耗时和步骤数（例如 `▸ Process · 8m 37s · 12 steps`），最终回复紧随其后；未产生回复就出错的轮次也会同样折叠。用户输入的 prompt 始终不参与折叠。把光标放在标题上按 `RET`、`TAB` 或点击可展开／再次折叠。新建会话默认选择 `auto` 权限（Host 未提供时使用 `danger-full-access`），可通过 `emacs-dsh-default-permission` 自定义；Emacs 原有 mode-line 的聊天 buffer 名显示工作目录（同名目录的多个会话会自动编号），并追加 DSH 空闲/思考/工具执行/等待操作的动态状态及队列数量（`S` 为 steer、`F` 为 follow-up，例如 `[S1 F2]`）。最近一条用户 query 保留在聊天记录中。新会话会自动读取 Host 默认模型。`/model` 可选择模型，`/reasoning` 可选择当前模型支持的思考程度。`/help` 显示客户端命令及 Host 提供的命令；其他 Host 命令由 `commands/list` 发现并交给 Host 执行。已注册的 `/skill-name` 作为 prompt 提交。
 
-用户消息和助手回复都使用 `markdown-mode` 的 Emacs 原生样式显示标题、强调、代码和链接，并隐藏部分 Markdown 标记；buffer 中仍保留原文，复制和搜索得到的是原始 Markdown。助手回复中的 HTTP(S) 链接可用 `RET` 或鼠标点击打开。流式回复先以轻量文本显示，消息完成后再排版。任务执行中的每个步骤显示为默认折叠的一行：工具调用带状态和参数摘要（`●` 运行中、`✓` 成功、`✗` 失败），推理显示为带标题的 `✻ Thinking`（将 `emacs-dsh-show-reasoning` 设为 nil 可隐藏）；把光标移到步骤上按 `RET`、`TAB` 或点击，可展开/收起完整参数、结果或推理内容。
+用户消息和助手回复都使用 `markdown-mode` 的 Emacs 原生样式显示标题、强调、代码和链接，并隐藏部分 Markdown 标记；buffer 中仍保留原文，复制和搜索得到的是原始 Markdown。助手回复中的 HTTP(S) 链接可用 `RET` 或鼠标点击打开。流式回复先以轻量文本显示，消息完成后再排版。纯空白助手消息不会生成空的 `DSH:` 行，回复首尾多余空行也不参与显示；正文内部段落、代码缩进和 `/copy` 使用的原文保持不变。任务执行中的每个步骤显示为默认折叠的一行：工具调用带状态和参数摘要（`●` 运行中、`✓` 成功、`✗` 失败），推理显示为带标题的 `✻ Thinking`（将 `emacs-dsh-show-reasoning` 设为 nil 可隐藏）；把光标移到步骤上按 `RET`、`TAB` 或点击，可展开/收起完整参数、结果或推理内容。
 
-输入 `@` 后按 `TAB` 可从 Host 文件和其他会话中选择引用。Host 没有文件候选时，会从当前工作目录就地补全文件和子目录；显式输入 `@~/` 或绝对路径时，还可补全项目外的本机目录。跨会话引用直接插入 Host 返回的 `@[标题](dsh-session:…)` 文本。`M-x emacs-dsh-insert-file` 可手动插入文件引用，`M-x emacs-dsh-attach-image` 可暂存图片；待发送图片显示在输入框上方，图形界面显示缩略图，点击预览即可移除。智能粘贴在 WSL 读取 Windows 剪贴板，在 macOS 读取本机剪贴板。
+输入 `@` 后按 `TAB` 直接列出当前聊天项目的本地文件/目录，空目录会明确显示路径；输入了路径片段后仍可使用 Host 候选和本地回退。输入 `@session` 后按 `TAB` 单独补全跨会话引用，列表按标题、目录、短 ID 对齐。文件与目录带不同标记；目录按 `RET` 插入草稿，再按 `TAB` 浏览子目录。路径补全继承当前补全样式（包括 Orderless），忽略大小写并局部关闭 smart-case，不修改全局设置。Host 没有路径片段候选时使用本地工作目录；显式输入 `@~/` 或绝对路径也支持项目外目录。多层目录浏览要求 Emacs 能访问对应文件系统。跨会话引用直接插入 Host 返回的 `@[标题](dsh-session:…)` 文本。`M-x emacs-dsh-insert-file` 可手动插入文件引用，`M-x emacs-dsh-attach-image` 可暂存图片。待发送预览现在是可移动光标的 buffer 内容：鼠标定位或将光标移到缩略图/名称上，按 `C-c C-o` 用系统查看器打开该图片；**只有旁边的 × 才会删除附件**。智能粘贴在 WSL 读取 Windows 剪贴板，在 macOS 读取本机剪贴板。
+
+`/help` 和 slash 补全共用去重后的客户端、Host（`commands/list`）及技能目录。Host 命令遵循 DSH 的原生语义，不把 Pi 专属命令当普通 prompt 发送。DSH 的 `/compact` **不接受参数**，要求空闲且没有待发送图片；提交后立即清空输入，并显示 `compacting`。失败时恢复命令并保留期间输入的新草稿。工具参数展开会解码 JSON Unicode 转义用于显示，不改变传输内容。
+
+客户端会话命令包括 `/name [标题]`（重命名，省略标题则弹出输入）、`/session`（会话信息）、`/copy`（复制最近已加载的助手回复 Markdown）和 `/quit`（关闭聊天）；`/export` 沿用 Host ZIP 导出流程。`/fork [事件序号]` 使用 `session/fork`，默认分叉最后一个已完成回合；`/clone` 使用同一接口复制到最新**已接收**事件，不保证包含 Host 随后新增的事件。两者要求空闲、无待发送图片且无队列写回，保留原聊天并打开新聊天。这些是客户端等价入口，不代表 DSH 暴露了全部 Pi CLI 命令。
 
 `C-c C-l`（或 `/queue`）打开独立队列窗口：在消息上按 `RET` 进入独立文本编辑 buffer，`C-c C-c` 暂存，`C-c C-k` 放弃；列表中 `d` 暂存删除、`s` 暂存转为 steer，最后按 `C-c C-c` 应用。`g` 放弃未应用修改并刷新，`q` 销毁队列和编辑 buffer，不影响聊天草稿。没有本地修改时，列表跟随 Host 的 inbox 投影自动更新；编辑期间队列已变化则拒绝应用，提示刷新。DSH 原生接口只支持编辑纯文本、删除和转为 steer，不支持排序、降回 follow-up 或编辑图片；图片消息可预览和查看，修改时需删除后重新发送。逐项操作可能部分成功，失败时保留剩余修改并明确提示，不自动重试。
 
@@ -111,4 +115,4 @@ Windows/WSL 的 Emacs 回归测试可运行；macOS 的剪贴板与路径有单�
 
 ## 与 emacs-pi 的交互一致性
 
-已按 emacs-pi 项目对话中的需求核对输入区、历史高亮、窗口、补全、折叠、队列和图片查看。完整对照和后端差异见 [UI 一致性记录](docs/UI-CONSISTENCY.md)。历史用户消息以当前主题 warning 颜色为整行背景，用于区分轮次，不再显示横向分隔线；输入区沿用灰色 widget-field。打开聊天会占满当前 frame；`C-c C-q` 销毁聊天和相关队列 buffer。`@` 的 minibuffer 补全可随输入逐层进入目录，兼容 Vertico/Orderless 和原生补全，补全不会删除 token 后面的草稿。
+已按 emacs-pi 项目对话中的需求核对输入区、历史高亮、窗口、补全、折叠、队列和图片查看。完整对照和后端差异见 [UI 一致性记录](docs/UI-CONSISTENCY.md)。历史用户消息以当前主题 warning 颜色为整行背景，用于区分轮次，不再显示横向分隔线；输入区沿用灰色 widget-field。打开聊天会占满当前 frame；`C-c C-q` 销毁聊天和相关队列 buffer。`@` 路径与 `@session` 会话入口分离，路径 minibuffer 可随输入逐层进入目录，兼容 Vertico/Orderless 和原生补全，补全不会删除 token 后面的草稿。

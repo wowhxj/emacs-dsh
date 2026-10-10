@@ -25,9 +25,9 @@
 | 运行中 Process 展开，子项折叠；完成后全部收起 | 新增运行中顶层 Process，保留手动切换；结束时重置整体和详情折叠，最终回答与所有用户消息保持可见 |
 | 步骤内容对齐 | DSH 的步骤统一从同一缩进列开始，详情继续缩进；保留 DSH: 助手标签 |
 | C-c C-q 后 buffer 不残留 | 保留 kill-buffer，并清理该聊天的队列与编辑 buffer |
-| @ 和 / 用 minibuffer，兼容 Orderless/Vertico | 保留 completing-read，补充原生 substring 匹配，不要求安装补全框架 |
+| @ 和 / 用 minibuffer，兼容 Orderless/Vertico | 保留 completing-read；路径类别显式继承当前 completion-styles，不要求安装补全框架 |
 | @ 引用其他 session | 保留 Host 返回的 canonical dsh-session mention 和服务器解析 |
-| ~/sandbox 和多层目录像 C-x C-f 一样深入补全 | @ picker 改为动态 collection，显式捕获聊天 root；minibuffer 变目录时重扫本地目录，隐藏 session 项；保留补全 token 后的草稿 |
+| ~/sandbox 和多层目录像 C-x C-f 一样深入补全 | @ picker 使用动态 collection 和聊天 root；从完整 minibuffer 输入确定本地目录，保留目录精确候选；RET 插入目录，后续 TAB 浏览子项；session 使用独立入口 |
 | queue 可编辑消息 | 新增独立列表和文本编辑 buffer，暂存后应用；保留原先 minibuffer/composer 编辑入口作为兼容命令 |
 | queue 调整顺序、steer/follow-up 双向转换 | 支持转为 steer；排序和降回 follow-up 无 DSH 原生接口，窗口明确说明，按对应键给可操作错误 |
 | queue 显示图片、编辑图片 | 支持历史式预览和 C-c C-o；图片编辑不受 DSH 接口支持，明确提示删除后重新发送 |
@@ -37,8 +37,41 @@
 | /reload | DSH 的服务端命令由 commands/list 发现；未新增虚假的 Pi 进程重启语义，未知命令保留草稿 |
 | 图片粘贴 | 保留 macOS/WSL 图片、文件和文本粘贴实现；没有更改 Pi 或用户 Emacs 配置 |
 | 输入区和历史显示图片缩略图 | 保留已有缩略图；历史原始内容或附件 ID 现在也可用于查看命令，终端可以按 ID 请求原图 |
-| 输入区图片点击删除 | 保留按图片索引删除，只影响对应待发送附件 |
+| 输入区图片点击删除（被后续需求取代） | 仅 × 控件按索引删除；图片/名称是可导航的只读文本，点击定位不会删除 |
 | 输入和历史图片 C-c C-o 放大查看，最终改用外部默认程序 | 新增统一查看命令：历史原图、Host 附件读取、多张待发送图片选择、系统默认查看器、临时文件退出清理 |
+
+## 指定聊天记录的补充核对
+
+本轮逐项对照 Pi session `01a0ec32-0fbb-706d-8c3f-99924549b86e` 的用户要求（以末尾用户确认的修复为准，忽略记录中滞后的压缩摘要）。
+
+| 需求 | 本轮前状态 | 本轮实现/验证 |
+| --- | --- | --- |
+| `@` 只补文件/目录，`@session` 单独补会话 | 缺失，仍混合候选 | 分离两条 API 路径，保留 Host canonical session mention |
+| 目录 RET 上屏，不自动进入下一级 | 无独立类别保护 | 使用 `emacs-dsh-file`，不触发 Vertico 的 file 类别导航 |
+| 目录选择不出现 Match Required | 动态列表不保留目录本身 | 保留本地有效目录和已提供的 Host 目录精确候选 |
+| Orderless 多词筛选完整外部路径 | 候选生成使用匹配器传入的短前缀 | 使用完整 minibuffer 输入选择目录，实测 Orderless 外部路径多词匹配 |
+| 大小写不敏感（包括大写输入） | 未显式关闭 smart-case | 局部 ignore-case + 关闭 Orderless smart-case；不改变全局配置 |
+| `/compact` 及参数/忙碌/附件/草稿保护 | 已走 Host commands/execute，但草稿等完成才清空 | 无参数、空闲/附件保护、即时清空、compacting 状态；失败与未知 Host 命令恢复草稿，新草稿不会被成功回调清空 |
+| CLI/插件命令、帮助、补全一致 | Host 原生命令已动态发现，帮助列表仍手写且未列技能 | 共用去重命令目录；本地入口优先，Host 原生指令与技能保持现有派发，不把未知指令作为普通 prompt |
+| `/name`、`/session`、`/copy`、`/quit` | 缺少 slash 入口（关闭已有快捷键） | 新增 rename API、会话元数据、最近已加载助手 Markdown 复制、关闭聊天入口 |
+| `/export` | 已有 | 保留 Host ZIP 导出与原有二进制/认证回归 |
+| `/fork`、`/clone` | 缺失 | 使用原生 session/fork；默认完成回合/显式事件序号/最新已接收前缀；拒绝忙碌、附件和队列写回并发 |
+| context/工具参数展开中文乱码 | HTTP/WebSocket 传输已使用 UTF-8；工具参数原样显示 JSON | 解码 JSON Unicode 转义只用于显示，非法 JSON 保留原文，false/null 保真 |
+| 粘贴图片点击不应删除，可移动光标后 C-c C-o | 查看器已有；预览是 overlay before-string，整项绑定删除 | 改为可导航 buffer 文本，名称/缩略图按 C-c C-o 查看对应附件；仅 × 删除 |
+| commit/push、同步用户 runtime | 属于交付动作，而非插件功能 | 按用户后续明确请求提交、推送并同步安装 checkout；不修改用户 init 配置或模型设置 |
+
+新增命令不伪装 Pi 专属协议：DSH `/compact` 不接受自定义指令；`/export` 是 ZIP，不是 Pi HTML；`/fork [事件序号]` 与 Pi 的输入条目选择器不同；`/clone` 复制收到的日志前缀，不承诺包含随后产生的 Host 事件。`/tree`、`/settings`、`/share` 等不做虚假的 Pi API 映射；如 DSH Host 自己注册命令，会由原生命令目录发现。
+
+## 截图反馈后的修正
+
+- `@session` 候选接口提供 `cwd`，原先客户端只显示标题与完整 ID。现在按显示列宽（而不是字符数）对齐标题、目录、短 ID，长路径保留首尾，保留 Host 的工作目录优先排序及 canonical mention。
+- 裸 `@` 优先枚举当前聊天的本地项目目录，不依赖 Host 的索引/过滤结果；已输入路径片段时仍保留 Host 查询。用户确认截图中的项目为 `~/sandbox/dsh/`，检查时此目录为空；空目录不能产生不存在的文件候选，改为明确显示项目路径。不会悄悄补全 `emacs-dsh` 或已安装的 DSH 源码目录。
+- DSH Host 的目录候选可能是 `kind: directory, path: docs`，没有末尾 `/`；客户端现在统一补上目录后缀，注解与后续 TAB 浏览保持一致。
+- 某些模型的工具调用前后含纯空白 text block，旧渲染器只检查长度非零，导致显示空 `DSH:` 和成片换行。现过滤纯空白消息、移除回复边界空行，保留正文内部空行和代码缩进；`/copy` 仍使用原始文本，不改模型设置或 Host 日志。
+- 已补 6 个回归，其中 5 个先确认失败再实现修复；新增用例分别覆盖 session 列对齐、裸 @ 本地优先、空目录诊断、Host 目录后缀、完整工具事件序列的紧凑显示和 Markdown/CRLF 保真。
+- 已渲染的历史不会因 load-file 自动重排。保留未发送草稿后，关闭聊天 buffer 并重新恢复该会话，可用新渲染器重放历史；不会删除 Host 会话。
+- 本轮源码和 `.elc` 版分别通过 130 项 ERT：129 通过、1 项 Windows DPAPI 测试跳过；严格字节编译、check-parens、diff 检查通过。elisp-checker 三阶段已执行，lint 仍有风格诊断，不宣称 lint 全通过。
+- GUI Emacs 未开启 server，不能直接热加载或读取当前聊天 root；目录通过用户选择确认。修复验证阶段未修改 runtime、模型设置或持久 Host 会话；安装同步按后续明确交付请求单独执行。GUI 鼠标/Vertico 的实际显示仍待用户验证。
 
 ## 有意保留的后端差异
 
@@ -49,7 +82,15 @@
 - Pi 的 /reload 重启单个 RPC 进程；DSH 复用共享 Host，客户端不能按此语义重启。DSH 可用命令以 Host 的实际目录为准。
 - DSH 的 contextPressure 与 Pi 的 contextUsage 字段不同，沿用各自报告的指标，不把累计 token 当作当前上下文。
 
-## 验证记录
+## 本轮补充验证
+
+- 源码与 `.elc` 编译版本分别运行全套 ERT：124 项，123 通过，0 失败；1 项 Windows DPAPI 集成测试在 macOS 跳过。Orderless 测试加载本机真实 Orderless 包执行，不是 stub，也未跳过。
+- 生产源码和测试均通过 `check-parens`、`byte-compile-error-on-warn=t` 严格字节编译与 `git diff --check`。编译在临时目录完成，不更改仓库或 runtime 的 `.elc`。
+- 已执行 elisp-checker 三个阶段；结构和编译通过，elisp-lint 仍报告行宽、缩进和 checkdoc 等风格诊断。脚本会在 lint FAIL 后输出 OK，不能将退出 0 当作风格检查通过。
+- 新增 17 项测试并更新旧交互测试，覆盖独立入口、Host/本地目录精确匹配、真实 Orderless 多词/大小写、compact 成功/异步失败/同步失败/未知命令/新草稿、命令目录一致性、rename/fork/clone/copy/session/quit、UTF-8 字节、Unicode 显示、可导航图片与旧 overlay 迁移。
+- 未调用真实模型、创建持久 Host 会话或启动外部图片查看器；GUI Vertico 目录 RET、图片鼠标定位、真实压缩/分叉仍需人工验收。本轮测试通过 mock Host API 与系统查看器验证请求、状态和数据；不等同于真实 Host 端到端测试。
+
+## 前轮验证记录
 
 - 修改前：97 项 ERT，96 通过，1 项 Windows DPAPI 集成测试在 macOS 跳过。
 - 修改后：107 项 ERT，106 通过，0 失败，1 项同上跳过。

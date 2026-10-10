@@ -27,6 +27,9 @@
 (require 'color)
 (declare-function w32-shell-execute "w32fns.c" (operation document &optional parameters show-flag))
 (defvar vertico-sort-function)          ; let-bound dynamically to keep our order
+(defvar orderless-smart-case)          ; disabled only inside path completion
+(defvar emacs-dsh--local-commands)      ; catalog defined with completion below
+(defvar emacs-dsh--queue-buffer)        ; queue panel defined below
 
 (defgroup emacs-dsh nil "Emacs client for DeepSeek Harness." :group 'tools)
 (defface emacs-dsh-status-face
@@ -126,6 +129,8 @@ The fallback is used only when the Host does not offer auto."
 (defvar-local emacs-dsh--inbox-trace nil)
 (defvar-local emacs-dsh--turn-start nil)
 (defvar-local emacs-dsh--final-start nil)
+(defvar-local emacs-dsh--last-answer nil)
+(defvar-local emacs-dsh--title nil)
 (defvar-local emacs-dsh--turn-has-process nil)
 (defvar-local emacs-dsh--turn-time nil "Host time in ms when the current turn began.")
 (defvar-local emacs-dsh--turn-steps 0 "Number of step lines in the current turn.")
@@ -729,6 +734,7 @@ An existing but invalid bridge must fail validation, not silently fall back."
     (propertize
      (emacs-dsh--line-string (format " DSH %s%s%s"
                                      (cond (emacs-dsh--queue-edit "editing queue")
+                                           ((eq emacs-dsh--command-inflight 'compact) "compacting")
                                            (emacs-dsh--waiting emacs-dsh--waiting)
                                            (emacs-dsh--active-tools
                                             (format "tool: %s" (car emacs-dsh--active-tools)))
@@ -859,6 +865,11 @@ An existing but invalid bridge must fail validation, not silently fall back."
 (defun emacs-dsh--draft-beginning ()
   "Return the stable start of the editable composer text."
   (+ (marker-position emacs-dsh--input-start)
+     (if (and (overlayp emacs-dsh--attachment-overlay)
+              (overlay-buffer emacs-dsh--attachment-overlay))
+         (- (overlay-end emacs-dsh--attachment-overlay)
+            (overlay-start emacs-dsh--attachment-overlay))
+       0)
      (length emacs-dsh--composer-prefix)))
 
 (defun emacs-dsh-select-draft ()
@@ -944,14 +955,14 @@ The original characters remain in the transcript for copying and search."
         (overlay-put overlay 'help-echo (concat "Open " url)))
       (setq offset (match-end 0)))))
 
-(defun emacs-dsh--decode-image (mime data)
-  "Return an Emacs image from base64 DATA of MIME type, or nil."
+(defun emacs-dsh--decode-image (mime data &optional width height)
+  "Return an image from base64 DATA of MIME, limited to WIDTH and HEIGHT."
   (let ((type (cdr (assoc mime '(("image/png" . png) ("image/jpeg" . jpeg)
                                  ("image/webp" . webp) ("image/gif" . gif))))))
     (and (display-images-p) type (stringp data)
          (ignore-errors
            (create-image (base64-decode-string data) type t
-                         :max-width 480 :max-height 320)))))
+                         :max-width (or width 480) :max-height (or height 320))))))
 
 (defun emacs-dsh--image-block (block)
   "Render a user image BLOCK, falling back to its label without pixels.
@@ -1286,12 +1297,25 @@ USER CONTENT may contain images."
           (not (emacs-dsh--tool-card-expanded card)))
     (emacs-dsh--refresh-tool-card card)))
 
+(defun emacs-dsh--display-arguments (arguments)
+  "Decode JSON Unicode escapes in ARGUMENTS for display, not transport."
+  (if (not (stringp arguments)) arguments
+    (condition-case nil
+        (decode-coding-string
+         (json-serialize (json-parse-string arguments :object-type 'hash-table
+                                            :null-object :null :false-object :false)
+                         :null-object :null :false-object :false)
+         'utf-8)
+      (error arguments))))
+
 (defun emacs-dsh--make-tool-card (id name arguments)
   "Insert a collapsed tool card for ID, NAME and ARGUMENTS."
   (emacs-dsh--make-step
    id name (emacs-dsh--tool-summary arguments)
    (if (and (stringp arguments) (not (string-empty-p arguments)))
-       (concat "    Arguments:\n" (replace-regexp-in-string "^" "    " arguments) "\n")
+       (concat "    Arguments:\n"
+                (replace-regexp-in-string "^" "    " (emacs-dsh--display-arguments arguments))
+                "\n")
      "    Arguments: none\n")
    'running))
 
@@ -1381,6 +1405,15 @@ DETAIL-TEXT is revealed on expansion; STATUS selects the header symbol."
     (setf (emacs-dsh--tool-card-status card) (if failed 'error 'success))
     (emacs-dsh--refresh-tool-card card)
     (force-mode-line-update)))
+
+(defun emacs-dsh--assistant-display-text (text)
+  "Remove only blank boundary lines from assistant TEXT for display.
+Pure whitespace does not represent a reply.  Keep internal paragraphs,
+code indentation and the raw answer used by /copy unchanged."
+  (if (string-blank-p text) ""
+    (replace-regexp-in-string
+     "\\(?:\r?\n[ \t\r]*\\)+\\'" ""
+     (replace-regexp-in-string "\\`\\(?:[ \t\r]*\n\\)+" "" text))))
 
 (defun emacs-dsh--content (blocks)
   (mapconcat
@@ -1484,7 +1517,8 @@ DETAIL-TEXT is revealed on expansion; STATUS selects the header symbol."
                        (cl-remove-if (lambda (block)
                                        (member (alist-get 'type block)
                                                '("reasoning" "tool-call")))
-                                     blocks))))
+                                     blocks)))
+                (display-text (emacs-dsh--assistant-display-text text)))
            (when emacs-dsh-show-reasoning
              (cl-loop for block in blocks
                       for index from 0
@@ -1497,14 +1531,15 @@ DETAIL-TEXT is revealed on expansion; STATUS selects the header symbol."
                            (replace-regexp-in-string "\\*\\*\\|^#+ *" "" thought))
                           (concat (replace-regexp-in-string "^" "    " thought) "\n")
                           'thought)))
-           (when (and emacs-dsh--turn-start (not (string-empty-p text)))
+           (when (and emacs-dsh--turn-start (not (string-empty-p display-text)))
              (when emacs-dsh--final-start (setq emacs-dsh--turn-has-process t))
              (setq emacs-dsh--final-start (copy-marker emacs-dsh--input-start nil)))
            (setq emacs-dsh--stream-text nil emacs-dsh--stream-id nil)
            (when emacs-dsh--stream-overlay
              (overlay-put emacs-dsh--stream-overlay 'before-string nil))
-           (unless (string-empty-p text)
-             (emacs-dsh--insert-message "DSH: " text))))
+           (unless (string-empty-p display-text)
+             (setq emacs-dsh--last-answer text)
+             (emacs-dsh--insert-message "DSH: " display-text))))
         ("tool/call"
          (setq emacs-dsh--turn-has-process t)
          (emacs-dsh--tool-call data seq))
@@ -1514,6 +1549,7 @@ DETAIL-TEXT is revealed on expansion; STATUS selects the header symbol."
          (setq emacs-dsh--model-selection data))
         ("agent-preset/selected"
          (setq emacs-dsh--agent-preset (alist-get 'agentPreset data)))
+        ("session/title" (setq emacs-dsh--title (alist-get 'title data)))
         ("request/header"
          (let* ((header (alist-get 'header data))
                 (config (alist-get 'config header))
@@ -1677,7 +1713,8 @@ DETAIL-TEXT is revealed on expansion; STATUS selects the header symbol."
                           (when-let* ((selection (alist-get 'next
                                                              (alist-get 'modelSelection values))))
                             (setq emacs-dsh--model-selection selection))
-                          (setq emacs-dsh--context-pressure
+                          (setq emacs-dsh--title (alist-get 'title values)
+                                emacs-dsh--context-pressure
                                 (alist-get 'contextPressure values)
                                 emacs-dsh--agent-preset
                                 (or (alist-get 'agentPreset values)
@@ -2707,43 +2744,68 @@ the identifying beginning and end of IDs and paths."
        (quit (message "emacs-dsh: export cancelled"))
        (user-error (message "emacs-dsh: export cancelled"))))))
 
+(defun emacs-dsh--restore-command-draft (draft)
+  "Restore rejected DRAFT without overwriting a newer composer value."
+  (let ((current (emacs-dsh--draft-text)))
+    (emacs-dsh--replace-draft
+     (concat draft (unless (string-empty-p current) (concat "\n" current))))))
+
 (defun emacs-dsh--execute-command (name draft mode)
   "Run native DSH command DRAFT, falling back only to a known skill NAME."
-  (let ((images emacs-dsh--attachments))
-    (emacs-dsh--call
-     "commands/execute"
-     `((agentId . ,emacs-dsh--session-id) (line . ,draft)
-       (submittedAttachments . ,(vconcat images)))
-     (lambda (value)
-       (if (null value)
-           (emacs-dsh--maybe-submit-skill name draft mode)
-         (let* ((result (alist-get 'result value))
-                (kind (alist-get 'kind result))
-                (output (alist-get 'text result)))
-           (setq emacs-dsh--command-inflight nil)
-           (if (equal kind "success")
-               (progn
-                 (when (equal draft (emacs-dsh--draft-text))
-                   (emacs-dsh--replace-draft ""))
-                 (when (equal images (cl-subseq emacs-dsh--attachments
-                                               0 (min (length images)
-                                                      (length emacs-dsh--attachments))))
-                   (setq emacs-dsh--attachments
-                         (nthcdr (length images) emacs-dsh--attachments))
-                   (emacs-dsh--update-image-preview))
-                 (force-mode-line-update)
+  (let ((images emacs-dsh--attachments)
+        (compact (equal name "compact")))
+    (when compact
+      (emacs-dsh--replace-draft "")
+      (force-mode-line-update))
+    (condition-case err
+        (emacs-dsh--call
+         "commands/execute"
+         `((agentId . ,emacs-dsh--session-id) (line . ,draft)
+           (submittedAttachments . ,(vconcat images)))
+         (lambda (value)
+           (if (null value)
+               (if compact
+                   (progn
+                     (setq emacs-dsh--command-inflight nil)
+                     (emacs-dsh--restore-command-draft draft)
+                     (message "emacs-dsh: Host does not support /compact"))
+                 (emacs-dsh--maybe-submit-skill name draft mode))
+             (let* ((result (alist-get 'result value))
+                    (kind (alist-get 'kind result))
+                    (output (alist-get 'text result)))
+               (setq emacs-dsh--command-inflight nil)
+               (if (equal kind "success")
+                   (progn
+                     (when (and (not compact) (equal draft (emacs-dsh--draft-text)))
+                       (emacs-dsh--replace-draft ""))
+                     (when (equal images (cl-subseq emacs-dsh--attachments
+                                                   0 (min (length images)
+                                                          (length emacs-dsh--attachments))))
+                       (setq emacs-dsh--attachments
+                             (nthcdr (length images) emacs-dsh--attachments))
+                       (emacs-dsh--update-image-preview))
+                     (force-mode-line-update)
+                     (emacs-dsh--insert-before-input
+                      (format "[command %s] %s" draft (or output "done")) 'shadow)
+                     (when (and (equal name "export")
+                                (string-match-p "\\`/export[[:space:]]*\\'" draft))
+                       (emacs-dsh--export-command)))
+                 (when compact (emacs-dsh--restore-command-draft draft))
                  (emacs-dsh--insert-before-input
-                  (format "[command %s] %s" draft (or output "done")) 'shadow)
-                 (when (and (equal name "export")
-                            (string-match-p "\\`/export[[:space:]]*\\'" draft))
-                   (emacs-dsh--export-command)))
-             (emacs-dsh--insert-before-input
-              (format "[command error %s] %s" draft (or output "command failed"))
-              'error)))))
-     (lambda (failure)
+                  (format "[command error %s] %s" draft (or output "command failed"))
+                  'error))
+               (force-mode-line-update))))
+         (lambda (failure)
+           (setq emacs-dsh--command-inflight nil)
+           (when compact (emacs-dsh--restore-command-draft draft))
+           (force-mode-line-update)
+           (emacs-dsh--insert-before-input
+            (format "[command error %s] %s" draft failure) 'error)))
+      (error
        (setq emacs-dsh--command-inflight nil)
-       (emacs-dsh--insert-before-input
-        (format "[command error %s] %s" draft failure) 'error)))))
+       (when compact (emacs-dsh--restore-command-draft draft))
+       (force-mode-line-update)
+       (signal (car err) (cdr err))))))
 
 (defun emacs-dsh--permission-command ()
   "Choose a Host-advertised permission for the current session."
@@ -2776,24 +2838,128 @@ the identifying beginning and end of IDs and paths."
     (user-error "Not in a DSH chat"))
   (emacs-dsh--permission-command))
 
-(defun emacs-dsh--help-command (draft)
-  "Display the available native commands and local controls."
+(defun emacs-dsh--command-entries (commands skills)
+  "Merge local COMMANDS and SKILLS into one name-deduplicated catalog."
+  (let ((seen (make-hash-table :test #'equal)))
+    (cl-remove-if-not
+     (lambda (entry)
+       (let ((name (car entry)))
+         (when (and (stringp name) (not (gethash name seen)))
+           (puthash name t seen))))
+     (append emacs-dsh--local-commands
+             (mapcar (lambda (item)
+                       (cons (alist-get 'name item)
+                             (or (alist-get 'description item) "Host command")))
+                     commands)
+             (mapcar (lambda (item)
+                       (cons (alist-get 'name item)
+                             (or (alist-get 'description item) "Skill")))
+                     skills)))))
+
+(defun emacs-dsh--command-catalog (callback)
+  "Fetch the shared Host, local and skill catalog, then invoke CALLBACK."
   (emacs-dsh--call
    "commands/list" `((agentId . ,emacs-dsh--session-id))
    (lambda (commands)
-     (setq emacs-dsh--command-inflight nil)
-     (when (equal draft (emacs-dsh--draft-text))
-       (emacs-dsh--replace-draft ""))
-     (emacs-dsh--insert-before-input
-       (concat "Commands: /model, /reasoning, /mode, /new, /resume, /queue, /file, /status, /help; Host: "
-              (mapconcat (lambda (command)
-                           (concat "/" (alist-get 'name command)))
-                         commands ", ")
-              ". Registered /skill-name entries also work as prompts.")
-      'shadow))
+     (emacs-dsh--call
+      "skills/list" `((request . ((sessionId . ,emacs-dsh--session-id))))
+      (lambda (value)
+        (funcall callback (emacs-dsh--command-entries commands (alist-get 'skills value))))
+      (lambda (failure)
+        (message "emacs-dsh: skills unavailable: %s" failure)
+        (funcall callback (emacs-dsh--command-entries commands nil)))))
    (lambda (failure)
+     (message "emacs-dsh: Host commands unavailable: %s" failure)
+     (funcall callback (emacs-dsh--command-entries nil nil)))))
+
+(defun emacs-dsh--help-command (draft)
+  "Display the same command catalog offered by TAB completion."
+  (emacs-dsh--command-catalog
+   (lambda (entries)
      (setq emacs-dsh--command-inflight nil)
-     (message "emacs-dsh: command list failed: %s" failure))))
+     (when (equal draft (emacs-dsh--draft-text)) (emacs-dsh--replace-draft ""))
+     (emacs-dsh--insert-before-input
+      (concat "Commands:\n"
+              (mapconcat (lambda (entry) (format "/%s — %s" (car entry) (cdr entry)))
+                         entries "\n")
+              "\nHost commands follow DSH, not Pi RPC. Registered skills run as prompts.")
+      'shadow))))
+
+(defun emacs-dsh--local-session-command (name draft &optional original)
+  "Run NAME with DRAFT, clearing only the unchanged ORIGINAL input."
+  (let ((arguments (string-trim (substring draft (1+ (length name)))))
+        (submitted (or original draft)))
+    (condition-case err
+        (progn
+          (when emacs-dsh--attachments
+            (user-error "Send or remove staged images before /%s" name))
+          (pcase name
+            ("name"
+             (if (string-empty-p arguments)
+                 (emacs-dsh--defer-picker
+                  (lambda ()
+                    (condition-case nil
+                        (let ((title (string-trim (read-string "DSH session name: "))))
+                          (when (string-empty-p title) (user-error "Session name cannot be empty"))
+                          (emacs-dsh--local-session-command
+                           "name" (concat "/name " title) submitted))
+                      ((quit error)
+                       (setq emacs-dsh--command-inflight nil)
+                       (message "emacs-dsh: rename cancelled")))))
+               (emacs-dsh--call
+                "session/rename"
+                `((request . ((sessionId . ,emacs-dsh--session-id) (title . ,arguments))))
+                (lambda (result)
+                  (setq emacs-dsh--title (alist-get 'title result)
+                        emacs-dsh--command-inflight nil)
+                  (when (equal submitted (emacs-dsh--draft-text)) (emacs-dsh--replace-draft ""))
+                  (emacs-dsh--insert-before-input
+                   (format "[session name] %s" emacs-dsh--title) 'shadow))
+                (lambda (failure)
+                  (setq emacs-dsh--command-inflight nil)
+                  (message "emacs-dsh: rename failed: %s" failure)))))
+            ((or "fork" "clone")
+             (when (or emacs-dsh--running emacs-dsh--queue-edit
+                       (and (buffer-live-p emacs-dsh--queue-buffer)
+                            (buffer-local-value 'emacs-dsh--queue-applying emacs-dsh--queue-buffer)))
+               (user-error "Wait for idle and finish queue changes before /%s" name))
+             (when (or (and (equal name "clone") (not (string-empty-p arguments)))
+                       (and (equal name "fork") (not (string-empty-p arguments))
+                            (not (string-match-p "\\`[0-9]+\\'" arguments))))
+               (user-error "Usage: /fork [event-seq] or /clone"))
+             (when (and (equal name "clone") (< emacs-dsh--cursor 0))
+               (user-error "No received history to clone yet"))
+             (let ((root emacs-dsh--root)
+                   (boundary (cond ((equal name "clone") emacs-dsh--cursor)
+                                   ((not (string-empty-p arguments)) (string-to-number arguments)))))
+               (emacs-dsh--call
+                "session/fork"
+                `((request . ,(append `((sessionId . ,emacs-dsh--session-id))
+                                     (when boundary `((atSeq . ,boundary))))))
+                (lambda (result)
+                  (setq emacs-dsh--command-inflight nil)
+                  (when (equal draft (emacs-dsh--draft-text)) (emacs-dsh--replace-draft ""))
+                  (emacs-dsh--show (alist-get 'sessionId result) root))
+                (lambda (failure)
+                  (setq emacs-dsh--command-inflight nil)
+                  (message "emacs-dsh: /%s failed: %s" name failure)))))
+            (_
+             (unless (string-empty-p arguments) (user-error "/%s takes no arguments" name))
+             (pcase name
+               ("copy"
+                (unless emacs-dsh--last-answer (user-error "No assistant answer to copy"))
+                (kill-new emacs-dsh--last-answer))
+               ("session"
+                (emacs-dsh--insert-before-input
+                 (format "Session: %s\nName: %s\nRoot: %s\n%s"
+                         emacs-dsh--session-id (or emacs-dsh--title "—") emacs-dsh--root
+                         (string-trim (substring-no-properties (emacs-dsh--state)))) 'shadow)))
+             (setq emacs-dsh--command-inflight nil)
+             (when (equal draft (emacs-dsh--draft-text)) (emacs-dsh--replace-draft ""))
+             (when (equal name "quit") (emacs-dsh-quit)))))
+      (error
+       (setq emacs-dsh--command-inflight nil)
+       (signal (car err) (cdr err))))))
 
 (defun emacs-dsh--submit-slash (mode draft)
   "Route DRAFT to the command plane or to a known skill."
@@ -2801,8 +2967,15 @@ the identifying beginning and end of IDs and paths."
     (unless name (user-error "Invalid slash command syntax"))
     (when emacs-dsh--command-inflight
       (user-error "A command is already in progress"))
-    (setq emacs-dsh--command-inflight t)
+    (when (equal name "compact")
+      (unless (string-match-p "\\`/compact[[:space:]]*\\'" draft)
+        (user-error "DSH /compact takes no arguments"))
+      (when (or emacs-dsh--running emacs-dsh--queue-edit emacs-dsh--attachments)
+        (user-error "Wait for idle and send or remove staged images before /compact")))
+    (setq emacs-dsh--command-inflight (if (equal name "compact") 'compact t))
     (cond
+     ((member name '("name" "session" "copy" "fork" "clone" "quit"))
+      (emacs-dsh--local-session-command name draft))
      ((equal name "model")
       (if emacs-dsh--attachments
           (progn (setq emacs-dsh--command-inflight nil)
@@ -3291,6 +3464,12 @@ messages carrying images or files cannot be edited."
         (let ((head (substring draft 0 offset)))
           (cond
            ((string-match
+             "\\(?:\\`\\|[[:space:]]\\)\\(@session\\(?:[ \t]+[^\n]*\\)?\\)\\'" head)
+            (let ((raw (match-string 1 head))
+                  (start (match-beginning 1)))
+              (list :kind 'session :start start :end offset :original raw
+                    :query (string-trim-left (substring raw 8)))))
+           ((string-match
              "\\(?:\\`\\|[[:space:]]\\)\\(@\\(?:\"[^\"]*\\|[^[:space:]\" ]*\\)\\)\\'"
              head)
             (let* ((raw (match-string 1 head))
@@ -3347,84 +3526,149 @@ messages carrying images or files cannot be edited."
                (directory-files directory)))))))
 
 (defun emacs-dsh--complete-host-file (context)
-  "Complete @ from Host files, local files, and cross-session references."
+  "Complete @ using file candidates only."
   (let ((query (plist-get context :query)))
-    (if (or (file-name-absolute-p query) (string-prefix-p "~/" query))
+    ;; Bare @ means this chat's directory, not the Host's fuzzy index.
+    ;; Even an empty local directory is authoritative, not a reason to
+    ;; silently show another workspace's files.
+    (if (or (file-name-absolute-p query) (string-prefix-p "~/" query)
+            (and (string-empty-p query) (stringp emacs-dsh--root)
+                 (file-directory-p emacs-dsh--root)))
         (emacs-dsh--show-reference-choices
          context (emacs-dsh--local-file-candidates query) nil)
-       (emacs-dsh--call
-        "fileReferences/list"
-        `((agentId . ,emacs-dsh--session-id) (query . ,query))
-        (lambda (files)
-          (emacs-dsh--complete-references
-           context (or files (emacs-dsh--local-file-candidates query))))
-        (lambda (failure)
-          (message "emacs-dsh: file candidates unavailable: %s" failure)
-          (emacs-dsh--complete-references
-           context (emacs-dsh--local-file-candidates query)))))))
+      (emacs-dsh--call
+       "fileReferences/list"
+       `((agentId . ,emacs-dsh--session-id) (query . ,query))
+       (lambda (files)
+         (emacs-dsh--show-reference-choices
+          context (or files (emacs-dsh--local-file-candidates query)) nil))
+       (lambda (failure)
+         (message "emacs-dsh: file candidates unavailable: %s" failure)
+         (emacs-dsh--show-reference-choices
+          context (emacs-dsh--local-file-candidates query) nil))))))
 
-(defun emacs-dsh--complete-references (context files)
-  "Finish @ completion with FILES and Host session candidates."
+(defun emacs-dsh--complete-session-reference (context)
+  "Complete @session through the Host's session-reference resolver."
   (emacs-dsh--call
    "sessionReferenceResolver/candidates"
    `((agentId . ,emacs-dsh--session-id)
      (query . ,(plist-get context :query)))
-    (lambda (sessions)
-      (emacs-dsh--show-reference-choices context files sessions))
-    (lambda (failure)
-      (message "emacs-dsh: session candidates unavailable: %s" failure)
-      (emacs-dsh--show-reference-choices context files nil))))
+   (lambda (sessions)
+     (emacs-dsh--show-reference-choices context nil sessions))
+   (lambda (failure)
+     (message "emacs-dsh: session candidates unavailable: %s" failure))))
+
+(defun emacs-dsh--reference-table (root query files values)
+  "Build a path table using ROOT, initial QUERY, FILES and result VALUES."
+  (lambda (input predicate action)
+    (if (eq action 'metadata)
+        '(metadata (category . emacs-dsh-file))
+      ;; Orderless may pass an empty INPUT.  Directory generation must use
+      ;; the full minibuffer query, not that shortened matching prefix.
+      (let* ((full (if (minibufferp (current-buffer))
+                       (minibuffer-contents-no-properties) input))
+             (emacs-dsh--root root)
+             (current
+              (append
+               (when (equal (file-name-directory full) (file-name-directory query))
+                 files)
+               (cl-loop for item in (emacs-dsh--local-file-candidates full)
+                        for path = (alist-get 'path item)
+                        for mention = (emacs-dsh--file-mention path)
+                        when mention collect (cons path mention))
+               ;; RET must still validate a selected directory, even though
+               ;; the new query now also generates its children.
+               (when (and (string-suffix-p "/" full)
+                          (or (assoc full files) (gethash full values)
+                              (file-directory-p (expand-file-name full root))))
+                 (list (cons full (emacs-dsh--file-mention full)))))))
+        (dolist (choice current) (puthash (car choice) (cdr choice) values))
+        (complete-with-action action (delete-dups (mapcar #'car current))
+                              input predicate)))))
+
+(defun emacs-dsh--session-reference-label (item)
+  "Format session ITEM in aligned title, directory and shortened ID columns."
+  (let* ((width (max 72 (window-body-width)))
+         (budget (- width 32))
+         (title-width (min 42 (/ budget 2)))
+         (path-width (min 44 (- budget title-width)))
+         (title (replace-regexp-in-string
+                 "[[:space:]]+" " "
+                 (or (alist-get 'displayTitle item) (alist-get 'label item) "untitled")))
+         (path (emacs-dsh--workspace-label item))
+         (short-title (emacs-dsh--middle-truncate title title-width))
+         (short-path (emacs-dsh--middle-truncate path path-width))
+         (id (emacs-dsh--middle-truncate (or (alist-get 'sessionId item) "?") 18)))
+    (concat short-title (make-string (max 0 (- title-width (string-width short-title))) ?\s)
+            "  " short-path (make-string (max 0 (- path-width (string-width short-path))) ?\s)
+            "  " id (make-string (max 0 (- 18 (string-width id))) ?\s) " [session]")))
+
+(defun emacs-dsh--reference-file-choice (item)
+  "Format Host or local file ITEM with an explicit directory slash."
+  (when-let* ((path (alist-get 'path item))
+              (valid (stringp path)))
+    (when (and (equal (alist-get 'kind item) "directory")
+               (not (string-suffix-p "/" path)))
+      (setq path (concat path "/")))
+    (when-let* ((mention (emacs-dsh--file-mention path)))
+      (cons path mention))))
 
 (defun emacs-dsh--show-reference-choices (context files sessions)
-  "Offer FILES and SESSIONS with dynamic directory navigation in the minibuffer."
+  "Offer FILES for @ or SESSIONS for @session, never a mixed list."
   (let* ((root emacs-dsh--root)
          (query (plist-get context :query))
-         (file-choices
-          (cl-loop for item in files for path = (alist-get 'path item)
-                   for mention = (and (stringp path) (emacs-dsh--file-mention path))
-                   when mention collect (cons path mention)))
-         (session-choices
-          (cl-loop for item in sessions for mention = (alist-get 'mention item)
-                   when (and (stringp mention) (string-prefix-p "@[" mention)
-                             (string-match-p "(dsh-session:" mention))
-                   collect (cons (format "%s · %s  [session]"
-                                         (or (alist-get 'displayTitle item)
-                                             (alist-get 'label item) "untitled")
-                                         (or (alist-get 'sessionId item) "?")) mention)))
-         (choices (append file-choices (unless (string-match-p "/" query) session-choices))))
-    (let ((matches (cl-remove-if-not
-                    (lambda (choice) (string-prefix-p query (car choice))) choices)))
-      (when (= (length matches) 1) (setq choices matches)))
+         (session-p (eq (plist-get context :kind) 'session))
+         (choices
+          (if session-p
+              (cl-loop for item in sessions for mention = (alist-get 'mention item)
+                       when (and (stringp mention) (string-prefix-p "@[" mention)
+                                 (string-match-p "(dsh-session:" mention))
+                       collect (cons (emacs-dsh--session-reference-label item) mention))
+            (delq nil (mapcar #'emacs-dsh--reference-file-choice files)))))
+    (unless session-p
+      (let ((matches (cl-remove-if-not
+                      (lambda (choice) (string-prefix-p query (car choice) t)) choices)))
+        (when (= (length matches) 1) (setq choices matches))))
     (cond
-     ((null choices) (message "emacs-dsh: no matching @ references"))
-     ;; Complete an unambiguous token directly, as before.
+     ((null choices)
+      (if (and (not session-p) (string-empty-p query)
+               (stringp root) (file-directory-p root))
+          (message "emacs-dsh: no files or directories in %s" (abbreviate-file-name root))
+        (message "emacs-dsh: no matching @ references")))
      ((= (length choices) 1) (emacs-dsh--replace-completion context (cdar choices)))
      (t
       (emacs-dsh--defer-picker
        (lambda ()
          (let* ((values (make-hash-table :test #'equal))
                 (collection
-                 (completion-table-dynamic
-                  (lambda (input)
-                    (let* ((emacs-dsh--root root)
-                           (current (append
-                                     (when (equal (file-name-directory input)
-                                                  (file-name-directory query)) file-choices)
-                                     (cl-loop for item in (emacs-dsh--local-file-candidates input)
-                                              for path = (alist-get 'path item)
-                                              collect (cons path (emacs-dsh--file-mention path)))
-                                     (unless (string-match-p "/" input) session-choices))))
-                      (dolist (choice current) (puthash (car choice) (cdr choice) values))
-                      (delete-dups (mapcar #'car current)))) t))
+                 (if session-p
+                     (lambda (input predicate action)
+                       (if (eq action 'metadata)
+                           '(metadata (category . emacs-dsh-session)
+                                      (display-sort-function . identity)
+                                      (cycle-sort-function . identity))
+                         (complete-with-action action (mapcar #'car choices) input predicate)))
+                   (emacs-dsh--reference-table root query choices values)))
                 (completion-styles (append completion-styles
-                                           (unless (memq 'substring completion-styles) '(substring))))
+                                           (unless (memq 'substring completion-styles)
+                                             '(substring))))
+                (completion-ignore-case t)
+                (read-file-name-completion-ignore-case t)
+                (orderless-smart-case nil)
+                (completion-category-overrides
+                 (cons `(emacs-dsh-file (styles . ,completion-styles))
+                       (assq-delete-all 'emacs-dsh-file
+                                        (copy-tree completion-category-overrides))))
                 (completion-extra-properties
-                 (list :annotation-function
-                       (lambda (candidate)
-                         (unless (string-suffix-p "[session]" candidate)
+                 (unless session-p
+                   (list :annotation-function
+                         (lambda (candidate)
                            (format "  [%s]" (if (string-suffix-p "/" candidate)
                                                 "directory" "file")))))))
-           (let* ((selected (completing-read "DSH @ reference: " collection nil t query))
+           (dolist (choice choices) (puthash (car choice) (cdr choice) values))
+           (let* ((selected (completing-read
+                             (if session-p "DSH @ session: " "DSH @ path: ")
+                             collection nil t query))
                   (mention (gethash selected values)))
              (when mention (emacs-dsh--replace-completion context mention))))))))))
 
@@ -3434,50 +3678,34 @@ messages carrying images or files cannot be edited."
      ("queue" . "Manage queued messages")
      ("mode" . "Select mode in a blank session")
     ("file" . "Insert a file reference") ("status" . "Show session status")
-    ("help" . "List commands"))
+    ("help" . "List commands") ("name" . "Rename session")
+    ("session" . "Show session metadata") ("copy" . "Copy latest assistant answer")
+    ("fork" . "Fork last completed turn or an event sequence")
+    ("clone" . "Clone received history into a new session")
+    ("quit" . "Close this chat without deleting the session"))
   "Commands implemented by the Emacs client rather than the Host registry.")
 
 (defun emacs-dsh--complete-slash (context)
-  "Complete a slash command from local, Host, and skill catalogs."
-  (emacs-dsh--call
-   "commands/list" `((agentId . ,emacs-dsh--session-id))
-   (lambda (commands)
-     (emacs-dsh--call
-      "skills/list" `((request . ((sessionId . ,emacs-dsh--session-id))))
-      (lambda (skills)
-        (let* ((entries (append
-                         emacs-dsh--local-commands
-                         (mapcar (lambda (item)
-                                   (cons (alist-get 'name item)
-                                         (or (alist-get 'description item) "Host command")))
-                                 commands)
-                         (mapcar (lambda (item)
-                                   (cons (alist-get 'name item)
-                                         (or (alist-get 'description item) "Skill")))
-                                 (alist-get 'skills skills))))
-               (prefix (plist-get context :query))
-               (choices (cl-loop for (name . description) in entries
-                                 when (and (stringp name)
-                                           (string-prefix-p prefix name))
-                                 collect (cons (format "/%s  — %s" name description)
-                                               (concat "/" name)))))
-          (cond
-           ((null choices) (message "emacs-dsh: no matching slash commands"))
-           ((= (length choices) 1)
-            (emacs-dsh--replace-completion context (cdar choices)))
-           (t
-            (emacs-dsh--defer-picker
-             (lambda ()
-               (when-let* ((choice (cdr (assoc
-                                         (let ((completion-styles
-                                                (append completion-styles '(substring))))
-                                           (completing-read "DSH command: " choices nil t))
-                                         choices))))
-                 (emacs-dsh--replace-completion context choice))))))))
-      (lambda (failure)
-        (message "emacs-dsh: skill completion failed: %s" failure))))
-   (lambda (failure)
-     (message "emacs-dsh: command completion failed: %s" failure))))
+  "Complete a slash command using the shared command catalog."
+  (emacs-dsh--command-catalog
+   (lambda (entries)
+     (let* ((prefix (plist-get context :query))
+            (choices (cl-loop for (name . description) in entries
+                              when (string-prefix-p prefix name)
+                              collect (cons (format "/%s  — %s" name description)
+                                            (concat "/" name)))))
+       (cond
+        ((null choices) (message "emacs-dsh: no matching slash commands"))
+        ((= (length choices) 1)
+         (emacs-dsh--replace-completion context (cdar choices)))
+        (t
+         (emacs-dsh--defer-picker
+          (lambda ()
+            (when-let* ((choice (cdr (assoc (let ((completion-styles
+                                                  (append completion-styles '(substring))))
+                                             (completing-read "DSH command: " choices nil t))
+                                            choices))))
+              (emacs-dsh--replace-completion context choice))))))))))
 
 ;;;###autoload
 (defun emacs-dsh-complete ()
@@ -3486,8 +3714,9 @@ messages carrying images or files cannot be edited."
   (let ((context (emacs-dsh--completion-context)))
     (pcase (plist-get context :kind)
       ('file (emacs-dsh--complete-host-file context))
+      ('session (emacs-dsh--complete-session-reference context))
       ('slash (emacs-dsh--complete-slash context))
-      (_ (message "emacs-dsh: TAB completes @files and /commands")))))
+      (_ (message "emacs-dsh: TAB completes @files, @session and /commands")))))
 
 (defun emacs-dsh--file-ref (path root)
   (let* ((relative (file-relative-name path root))
@@ -3620,56 +3849,57 @@ messages carrying images or files cannot be edited."
   (let ((map (make-sparse-keymap)))
     (define-key map [mouse-1] #'emacs-dsh-remove-image)
     map)
-  "Mouse map for removing a staged image from its preview.")
+  "Mouse map on a staged image’s × remove control.")
 
 (defun emacs-dsh--update-image-preview ()
-  "Show staged image thumbnails above the composer, with remove controls."
+  "Render navigable staged images; only each × control removes an image."
   (when emacs-dsh--input-start
-    (unless (overlayp emacs-dsh--attachment-overlay)
-      (let ((pos (marker-position emacs-dsh--input-start)))
-        (setq emacs-dsh--attachment-overlay (make-overlay pos pos nil t t))
-        (overlay-put emacs-dsh--attachment-overlay 'priority 1)))
-    (move-overlay emacs-dsh--attachment-overlay
-                  (marker-position emacs-dsh--input-start)
-                  (marker-position emacs-dsh--input-start))
-    (overlay-put
-     emacs-dsh--attachment-overlay 'before-string
-     (when emacs-dsh--attachments
-       (concat "\n"
-               (string-join
-                (cl-loop for attachment in emacs-dsh--attachments
-                         for index from 0
-                         collect
-                         (let* ((mime (alist-get 'mediaType attachment))
-                                (type (cdr (assoc mime '(("image/png" . png)
-                                                          ("image/jpeg" . jpeg)
-                                                          ("image/webp" . webp)
-                                                          ("image/gif" . gif)))))
-                                (image (and (display-images-p) type
-                                            (ignore-errors
-                                              (create-image
-                                               (base64-decode-string
-                                                (alist-get 'data attachment))
-                                               type t :data-p t :max-width 200
-                                               :max-height 100 :margin '(4 . 4)))))
-                                (label (concat (if image
-                                                   (propertize " " 'display image)
-                                                 "[image]")
-                                               " " (or (alist-get 'name attachment) "image")
-                                               " ×  ")))
-                           (propertize label 'keymap emacs-dsh--image-remove-map
-                                       'emacs-dsh-image-index index
-                                       'mouse-face 'highlight
-                                       'help-echo "Click to remove staged image")))
-                "\n")
-               "\n")))))
+    (let* ((inhibit-read-only t)
+           (begin (marker-position emacs-dsh--input-start))
+           (end (if (and (overlayp emacs-dsh--attachment-overlay)
+                         (overlay-buffer emacs-dsh--attachment-overlay))
+                    (overlay-end emacs-dsh--attachment-overlay) begin)))
+      (save-excursion
+        (delete-region begin end)
+        (goto-char begin)
+        (when emacs-dsh--attachments
+          (insert "\n")
+          (cl-loop for attachment in emacs-dsh--attachments for index from 0 do
+                   (let* ((mime (alist-get 'mediaType attachment))
+                          (image (emacs-dsh--decode-image mime (alist-get 'data attachment) 200 100))
+                          (label (concat (if image (propertize " " 'display image) "[image]")
+                                         " " (or (alist-get 'name attachment) "image") " ")))
+                     (insert (propertize label
+                                         'emacs-dsh-image attachment
+                                         'emacs-dsh-image-index index
+                                         'mouse-face 'highlight
+                                         'help-echo "C-c C-o: open in system image viewer")
+                             (propertize "×" 'keymap emacs-dsh--image-remove-map
+                                         'emacs-dsh-image-index index
+                                         'mouse-face 'highlight
+                                         'help-echo "Click to remove staged image")
+                             "\n")))
+          (insert "\n"))
+        (add-text-properties begin (point)
+                             '(read-only t rear-nonsticky t))
+        ;; Replace legacy zero-width before-string previews too, so source
+        ;; reloads do not leave duplicate thumbnails or old removal maps.
+        (when (overlayp emacs-dsh--attachment-overlay)
+          (delete-overlay emacs-dsh--attachment-overlay))
+        (setq emacs-dsh--attachment-overlay (make-overlay begin (point) nil t nil))
+        ;; New history belongs before this region, not inside it.
+        (set-marker emacs-dsh--input-start begin)))))
 
 (defun emacs-dsh-remove-image (event)
-  "Remove the staged image clicked in the composer preview."
+  "Remove only the staged image whose × control received EVENT."
   (interactive "e")
-  (let* ((hit (posn-string (event-start event)))
-         (index (and hit (get-text-property (cdr hit)
-                                            'emacs-dsh-image-index (car hit)))))
+  (let* ((position (event-start event))
+         (hit (posn-string position))
+         (point (unless hit (posn-point position)))
+         (index (if hit
+                    (get-text-property (cdr hit) 'emacs-dsh-image-index (car hit))
+                  (and (integerp point)
+                       (get-text-property point 'emacs-dsh-image-index)))))
     (unless (and (integerp index) (< index (length emacs-dsh--attachments)))
       (user-error "No staged image at this position"))
     (setq emacs-dsh--attachments
