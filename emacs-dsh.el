@@ -2107,9 +2107,11 @@ MAX-MESSAGES limits history included in the first snapshot."
 (defun emacs-dsh-chat (&optional root choose-mode)
   "Choose a DSH Session in ROOT, or create one if requested.
 With prefix CHOOSE-MODE, select a preset if creating a new session."
-  (interactive (list (read-directory-name "DSH root: " (emacs-dsh--project-root) nil t)
+  (interactive (list (read-directory-name "DSH root: " (emacs-dsh--project-root) nil nil)
                      current-prefix-arg))
   (setq root (file-name-as-directory (expand-file-name (or root (emacs-dsh--project-root)))))
+  (unless (file-directory-p root)
+    (make-directory root t))
   (emacs-dsh--choose-session-for-root root choose-mode))
 
 (defun emacs-dsh--choose-session-for-root (root choose-mode)
