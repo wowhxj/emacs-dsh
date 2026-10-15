@@ -84,6 +84,14 @@
 - 验证：源码和严格字节编译后的完整 ERT 均为 136 项中 135 通过、1 项 Windows DPAPI 跳过；check-parens、严格编译、git diff --check 通过。checker 的 elisp-lint 仍报告已有的格式/checkdoc 风格问题，未视为 lint 全通过。
 - 更新安装 runtime 后，已加载的旧定义仍需重新 load-file 或重启 Emacs，并建议保留草稿后重开会话，避免旧 buffer 的残留标记。不修改 Host 持久历史；GUI 未开启 Emacs server 时无法远程热加载，图形显示仍需人工确认。
 
+## 多轮对话的流式回复位置修正
+
+- 原实现只创建一次零宽 stream overlay，且两端均不随边界插入前进。第一轮结束后，后续用户消息/回复不断插入，但 overlay 仍停在第一轮位置，导致新一轮临时回复出现在旧对话前面。问题在瞬时显示层，不修改 Host 日志或历史消息顺序。
+- 现在每帧都将 stream overlay 重新定位到当前 transcript 尾部；新 overlay 的两端随规范历史插入前进，处理流开始后用户消息或工具步骤才到达的时序。已有旧 overlay 也会在下一帧重新校准。
+- 图片预览重建后同步校准 stream overlay，使临时回复保持在待发送附件及 `You>` 上方；不修改草稿、光标或已完成的历史文本。正式消息到达后仍清除临时层，避免重复显示。
+- 新增 4 项回归，其中 3 项在修复前确认失败，覆盖连续三轮、用户消息延迟到达及工具插入、旧 overlay 和附件增删。源码与严格编译版均为 140 项中 139 通过、1 项 Windows DPAPI 跳过；check-parens 和 git diff --check 通过，checker 的已有 lint 风格诊断仍单独保留。
+- 验证针对源码和临时编译副本；安装 runtime 需要同步更新后重新加载。尚未重新加载的 GUI 仍会执行旧定义，不能仅凭源码测试认定当前窗口已修复。
+
 ## 有意保留的后端差异
 
 - DSH 通过 Host 的 session/updateQueue 按持久 item ID 更新；Pi 用 clear_queue 加逐条重发。此处采用 DSH 原生修改，应用前核对本地权威 inbox 快照；运行中仍可能被消费，服务端可拒绝后续操作，不能保证批量原子性。

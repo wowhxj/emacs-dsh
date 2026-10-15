@@ -190,6 +190,106 @@
       (should (= 1 (cl-count-if (lambda (line) (string-prefix-p "DSH: hello" line))
                                 (split-string (buffer-string) "\n")))))))
 
+(ert-deftest emacs-dsh-stream-stays-after-the-latest-prompt-across-turns ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--compose)
+    (emacs-dsh--replace-draft "unsent draft")
+    (dotimes (round 3)
+      (let ((seq (* round 4))
+            (attempt (format "attempt-%d" round))
+            (prompt (format "prompt-%d" round))
+            (answer (format "answer-%d" round)))
+        (emacs-dsh--event `((type . "turn/start") (seq . ,(1+ seq))))
+        (emacs-dsh--event
+         `((type . "user/message") (seq . ,(+ seq 2))
+           (data . ((content . [((type . "text") (text . ,prompt))])))))
+        (let ((history (buffer-string)) (position (point)))
+          (emacs-dsh--stream `((type . "start") (attemptId . ,attempt)))
+          (emacs-dsh--stream
+           `((type . "chunk") (attemptId . ,attempt)
+             (chunk . ((type . "text-delta") (text . ,answer)))))
+          (should (= (overlay-start emacs-dsh--stream-overlay)
+                     (marker-position emacs-dsh--input-start)))
+          (should (= (overlay-end emacs-dsh--stream-overlay)
+                     (marker-position emacs-dsh--input-start)))
+          (should (> (overlay-start emacs-dsh--stream-overlay)
+                     (save-excursion
+                       (goto-char (point-max))
+                       (search-backward (concat "You: " prompt)))))
+          (should (equal (buffer-string) history))
+          (should (= (point) position))
+          (should (equal (emacs-dsh--draft-text) "unsent draft")))
+        (emacs-dsh--event
+         `((type . "assistant/message") (seq . ,(+ seq 3))
+           (data . ((message . ((content . [((type . "text") (text . ,answer))])))))))
+        (should-not (overlay-get emacs-dsh--stream-overlay 'before-string))
+        (emacs-dsh--stream `((type . "end") (attemptId . ,attempt)))
+        (emacs-dsh--event
+         `((type . "turn/end") (seq . ,(+ seq 4))
+           (data . ((reason . ((kind . "completed")))))))
+        (should (= 1 (cl-count (concat "DSH: " answer)
+                              (split-string (buffer-string) "\n") :test #'equal)))))))
+
+(ert-deftest emacs-dsh-stream-follows-delayed-prompt-and-tool-inserts ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--compose)
+    ;; The text stream and canonical event log are delivered independently.
+    (emacs-dsh--stream '((type . "start") (attemptId . "a1")))
+    (emacs-dsh--event
+     '((type . "user/message") (seq . 1)
+       (data . ((content . [((type . "text") (text . "new prompt"))])))))
+    (should (= (overlay-start emacs-dsh--stream-overlay)
+               (marker-position emacs-dsh--input-start)))
+    (emacs-dsh--stream
+     '((type . "chunk") (attemptId . "a1")
+       (chunk . ((type . "text-delta") (text . "partial reply")))))
+    (emacs-dsh--event
+     '((type . "tool/call") (seq . 2)
+       (data . ((toolCallId . "call1") (toolName . "Read") (args . "{}")))))
+    (should (= (overlay-start emacs-dsh--stream-overlay)
+               (marker-position emacs-dsh--input-start)))
+    (should (string-match-p "partial reply"
+                            (overlay-get emacs-dsh--stream-overlay 'before-string)))))
+
+(ert-deftest emacs-dsh-stream-reanchors-existing-stale-overlay ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--compose)
+    ;; Simulate a persistent overlay left by an older loaded definition.
+    (setq emacs-dsh--stream-overlay (make-overlay (point-min) (point-min)))
+    (emacs-dsh--insert-before-input "You: latest prompt")
+    (emacs-dsh--stream '((type . "start") (attemptId . "a1")))
+    (emacs-dsh--stream
+     '((type . "chunk") (attemptId . "a1")
+       (chunk . ((type . "text-delta") (text . "latest reply")))))
+    (should (= (overlay-start emacs-dsh--stream-overlay)
+               (marker-position emacs-dsh--input-start)))
+    (should (string-match-p "latest reply"
+                            (overlay-get emacs-dsh--stream-overlay 'before-string)))))
+
+(ert-deftest emacs-dsh-stream-remains-before-staged-image-previews ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (setq emacs-dsh--session-id "s1")
+    (emacs-dsh--compose)
+    (emacs-dsh--insert-before-input "You: running query")
+    (emacs-dsh--replace-draft "next query")
+    (emacs-dsh--stream '((type . "start") (attemptId . "a1")))
+    (emacs-dsh--stream
+     '((type . "chunk") (attemptId . "a1")
+       (chunk . ((type . "text-delta") (text . "partial reply")))))
+    (emacs-dsh--stage-image "image/png" "next.png" "aGVsbG8=")
+    (should (= (overlay-start emacs-dsh--stream-overlay)
+               (overlay-start emacs-dsh--attachment-overlay)))
+    (should (equal (emacs-dsh--draft-text) "next query"))
+    (setq emacs-dsh--attachments nil)
+    (emacs-dsh--update-image-preview)
+    (should (= (overlay-start emacs-dsh--stream-overlay)
+               (marker-position emacs-dsh--input-start)))
+    (should (equal (emacs-dsh--draft-text) "next query"))))
+
 (ert-deftest emacs-dsh-direct-final-reply-needs-no-process-fold ()
   (with-temp-buffer
     (emacs-dsh-chat-mode)

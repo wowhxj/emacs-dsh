@@ -1606,9 +1606,14 @@ code indentation and the raw answer used by /copy unchanged."
            (setq emacs-dsh--stream-text
                  (concat emacs-dsh--stream-text (alist-get 'text chunk)))))))
     ("end" (setq emacs-dsh--stream-id nil emacs-dsh--stream-text nil)))
-  (when (and emacs-dsh--input-start (not emacs-dsh--stream-overlay))
-    (setq emacs-dsh--stream-overlay (make-overlay emacs-dsh--input-start
-                                                  emacs-dsh--input-start)))
+  (when emacs-dsh--input-start
+    ;; Reusing an overlay must not reuse the first turn's transcript position.
+    (if (overlayp emacs-dsh--stream-overlay)
+        (move-overlay emacs-dsh--stream-overlay emacs-dsh--input-start
+                      emacs-dsh--input-start (current-buffer))
+      ;; Both bounds follow canonical messages arriving between stream frames.
+      (setq emacs-dsh--stream-overlay
+            (make-overlay emacs-dsh--input-start emacs-dsh--input-start nil t t))))
   (when emacs-dsh--stream-overlay
     (overlay-put emacs-dsh--stream-overlay 'before-string
                   (and emacs-dsh--stream-text
@@ -3892,7 +3897,12 @@ messages carrying images or files cannot be edited."
             (add-text-properties begin (point) '(read-only t rear-nonsticky t))
             (setq emacs-dsh--attachment-overlay (make-overlay begin (point) nil t nil))
             ;; Live history is inserted before the whole composer group.
-            (set-marker emacs-dsh--input-start begin)))))))
+            (set-marker emacs-dsh--input-start begin))
+          ;; Preview insertion also moves advancing overlays.  Keep the live
+          ;; reply before pending attachments, even before the next chunk.
+          (when (overlayp emacs-dsh--stream-overlay)
+            (move-overlay emacs-dsh--stream-overlay emacs-dsh--input-start
+                          emacs-dsh--input-start (current-buffer))))))))
 
 (defun emacs-dsh-remove-image (event)
   "Remove only the staged image whose × control received EVENT."
