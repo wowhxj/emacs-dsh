@@ -776,6 +776,7 @@ An existing but invalid bridge must fail validation, not silently fall back."
         (setq emacs-dsh--draft nil)
         (setq-local emacs-dsh--draft
                      (widget-create 'editable-field :format "%v"
+                                    :value-face '(:inherit widget-field :underline nil)
                                     :keymap (if emacs-dsh--queue-edit
                                                 emacs-dsh--queue-edit-input-keymap
                                               emacs-dsh--input-keymap)
@@ -785,7 +786,7 @@ An existing but invalid bridge must fail validation, not silently fall back."
                    (make-overlay (1+ (marker-position emacs-dsh--input-start))
                                  (point-max) nil t t))
        (overlay-put emacs-dsh--input-background 'face
-                    '(:inherit widget-field :extend t))
+                    '(:inherit widget-field :underline nil :extend t))
        (set-marker-insertion-type emacs-dsh--input-start t)
        (goto-char start)
        (when emacs-dsh--attachments
@@ -863,14 +864,9 @@ An existing but invalid bridge must fail validation, not silently fall back."
     (if widget (string-trim (widget-value widget)) "")))
 
 (defun emacs-dsh--draft-beginning ()
-  "Return the stable start of the editable composer text."
-  (+ (marker-position emacs-dsh--input-start)
-     (if (and (overlayp emacs-dsh--attachment-overlay)
-              (overlay-buffer emacs-dsh--attachment-overlay))
-         (- (overlay-end emacs-dsh--attachment-overlay)
-            (overlay-start emacs-dsh--attachment-overlay))
-       0)
-     (length emacs-dsh--composer-prefix)))
+  "Return the widget's actual editable start, independent of previews."
+  (unless (emacs-dsh--input-widget) (user-error "Not in a DSH chat"))
+  (widget-field-start emacs-dsh--draft))
 
 (defun emacs-dsh-select-draft ()
   "Select only the text in the current chat's composer."
@@ -3854,43 +3850,49 @@ messages carrying images or files cannot be edited."
   "Mouse map on a staged image’s × remove control.")
 
 (defun emacs-dsh--update-image-preview ()
-  "Render navigable staged images; only each × control removes an image."
-  (when emacs-dsh--input-start
-    (let* ((inhibit-read-only t)
-           (begin (marker-position emacs-dsh--input-start))
-           (end (if (and (overlayp emacs-dsh--attachment-overlay)
-                         (overlay-buffer emacs-dsh--attachment-overlay))
-                    (overlay-end emacs-dsh--attachment-overlay) begin)))
+  "Show staged images above You>, never inside the editable field."
+  (when-let* ((widget (emacs-dsh--input-widget)))
+    (let ((inhibit-read-only t))
       (save-excursion
-        (delete-region begin end)
-        (goto-char begin)
-        (when emacs-dsh--attachments
-          (insert "\n")
-          (cl-loop for attachment in emacs-dsh--attachments for index from 0 do
-                   (let* ((mime (alist-get 'mediaType attachment))
-                          (image (emacs-dsh--decode-image mime (alist-get 'data attachment) 200 100))
-                          (label (concat (if image (propertize " " 'display image) "[image]")
-                                         " " (or (alist-get 'name attachment) "image") " ")))
-                     (insert (propertize label
-                                         'emacs-dsh-image attachment
-                                         'emacs-dsh-image-index index
-                                         'mouse-face 'highlight
-                                         'help-echo "C-c C-o: open in system image viewer")
-                             (propertize "×" 'keymap emacs-dsh--image-remove-map
-                                         'emacs-dsh-image-index index
-                                         'mouse-face 'highlight
-                                         'help-echo "Click to remove staged image")
-                             "\n")))
-          (insert "\n"))
-        (add-text-properties begin (point)
-                             '(read-only t rear-nonsticky t))
-        ;; Replace legacy zero-width before-string previews too, so source
-        ;; reloads do not leave duplicate thumbnails or old removal maps.
+        ;; Use the preview's own bounds, not a separately moving transcript
+        ;; marker.  Destroy empty overlays too: their insertion behavior
+        ;; differs from nonempty previews when live history arrives.
         (when (overlayp emacs-dsh--attachment-overlay)
+          (when (overlay-buffer emacs-dsh--attachment-overlay)
+            (delete-region (overlay-start emacs-dsh--attachment-overlay)
+                           (overlay-end emacs-dsh--attachment-overlay)))
           (delete-overlay emacs-dsh--attachment-overlay))
-        (setq emacs-dsh--attachment-overlay (make-overlay begin (point) nil t nil))
-        ;; New history belongs before this region, not inside it.
-        (set-marker emacs-dsh--input-start begin)))))
+        (setq emacs-dsh--attachment-overlay nil)
+        (let* ((field-start (widget-field-start widget))
+               (begin (- field-start (length emacs-dsh--composer-prefix))))
+          (unless (and (>= begin (point-min))
+                       (equal (buffer-substring-no-properties begin field-start)
+                              emacs-dsh--composer-prefix))
+            (user-error "Chat composer is out of date; close and reopen this session"))
+          (set-marker emacs-dsh--input-start begin)
+          (when emacs-dsh--attachments
+            (goto-char begin)
+            (insert "\n")
+            (cl-loop for attachment in emacs-dsh--attachments for index from 0 do
+                     (let* ((mime (alist-get 'mediaType attachment))
+                            (image (emacs-dsh--decode-image mime (alist-get 'data attachment) 200 100))
+                            (label (concat (if image (propertize " " 'display image) "[image]")
+                                           " " (or (alist-get 'name attachment) "image") " ")))
+                       (insert (propertize label
+                                           'emacs-dsh-image attachment
+                                           'emacs-dsh-image-index index
+                                           'mouse-face 'highlight
+                                           'help-echo "C-c C-o: open in system image viewer")
+                               (propertize "×" 'keymap emacs-dsh--image-remove-map
+                                           'emacs-dsh-image-index index
+                                           'mouse-face 'highlight
+                                           'help-echo "Click to remove staged image")
+                               "\n")))
+            (insert "\n")
+            (add-text-properties begin (point) '(read-only t rear-nonsticky t))
+            (setq emacs-dsh--attachment-overlay (make-overlay begin (point) nil t nil))
+            ;; Live history is inserted before the whole composer group.
+            (set-marker emacs-dsh--input-start begin)))))))
 
 (defun emacs-dsh-remove-image (event)
   "Remove only the staged image whose × control received EVENT."

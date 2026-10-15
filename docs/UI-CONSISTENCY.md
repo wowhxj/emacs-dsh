@@ -73,6 +73,17 @@
 - 本轮源码和 `.elc` 版分别通过 130 项 ERT：129 通过、1 项 Windows DPAPI 测试跳过；严格字节编译、check-parens、diff 检查通过。elisp-checker 三阶段已执行，lint 仍有风格诊断，不宣称 lint 全通过。
 - GUI Emacs 未开启 server，不能直接热加载或读取当前聊天 root；目录通过用户选择确认。修复验证阶段未修改 runtime、模型设置或持久 Host 会话；安装同步按后续明确交付请求单独执行。GUI 鼠标/Vertico 的实际显示仍待用户验证。
 
+## 图片预览与输入区外观修正
+
+- 旧预览清理后保留零宽 overlay，实时历史插入会使其与 `input-start` marker 失步；后续贴图/失败恢复按混合锚点删除文本，可导致越界、错误删除和预览位置异常。
+- 现在清理使用预览 overlay 自己的完整范围，并立即销毁 overlay，附件为空时保持 nil；不再留下浮动的空预览区域。
+- 草稿起点直接采用 `widget-field-start`；预览从真实字段前的 `You>` 前缀位置插入，与可编辑文本完全分离，实时历史仍插在整个输入区上方。不再将预览长度参与草稿位置计算。
+- 提交即清除本次预览和附件；失败恢复时保留期间新增的文字、图片，成功回调也不会删除新草稿或新图片。已提交的历史图片仍保留。
+- 输入 widget 和输入区底色 overlay 均局部设置 `:underline nil`，保留原有底色；不修改全局 `widget-field` face 或其他输入框。现有外观回归同时验证两处 face。
+- 新增 5 项回归，其中 3 项先确认失败；覆盖提交后 overlay/text 清理、历史到达后再贴图、异步失败恢复、过期输入 marker 重新定位、成功回调保留新图片。旧用例同步改为断言无 overlay，而不是只检查 before-string。
+- 验证：源码和严格字节编译后的完整 ERT 均为 136 项中 135 通过、1 项 Windows DPAPI 跳过；check-parens、严格编译、git diff --check 通过。checker 的 elisp-lint 仍报告已有的格式/checkdoc 风格问题，未视为 lint 全通过。
+- 更新安装 runtime 后，已加载的旧定义仍需重新 load-file 或重启 Emacs，并建议保留草稿后重开会话，避免旧 buffer 的残留标记。不修改 Host 持久历史；GUI 未开启 Emacs server 时无法远程热加载，图形显示仍需人工确认。
+
 ## 有意保留的后端差异
 
 - DSH 通过 Host 的 session/updateQueue 按持久 item ID 更新；Pi 用 clear_queue 加逐条重发。此处采用 DSH 原生修改，应用前核对本地权威 inbox 快照；运行中仍可能被消费，服务端可拒绝后续操作，不能保证批量原子性。
