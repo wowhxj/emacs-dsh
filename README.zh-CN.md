@@ -2,6 +2,8 @@
 
 [English](README.md) | 简体中文
 
+开发中：[会话枚举与指定恢复接口](PUBLIC-API.md)，含 Host 契约未验证项和当前限制。
+
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的 Emacs 客户端，交互方式参考 [pimacs.el](https://github.com/ananthakumaran/pimacs.el)。支持创建和恢复会话、流式回复、模型与思考程度切换、`/` 命令、技能、队列管理、`@` 文件和跨会话引用补全，以及图片附件。连接时无需输入用户名、密码或手动粘贴 token。
 
 ## 连接方式

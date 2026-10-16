@@ -109,7 +109,14 @@ The fallback is used only when the Host does not offer auto."
 (defvar emacs-dsh--managed-output "" "Bounded startup output before a launch URL arrives.")
 (defvar emacs-dsh--managed-waiters nil "Callbacks waiting for managed Host startup.")
 (defvar emacs-dsh--managed-timer nil "Startup timeout for the managed Host.")
+(defvar-local emacs-dsh--source nil)
+(defvar-local emacs-dsh--verified-session nil)
 (defvar-local emacs-dsh--session-id nil)
+
+(defun emacs-dsh--source-identity ()
+  "Return the current authenticated Host generation without credentials."
+  (list emacs-dsh--authenticated-base emacs-dsh--authenticated-nonce
+        emacs-dsh--authenticated-mode))
 (defvar-local emacs-dsh--root nil)
 (defvar-local emacs-dsh--socket nil)
 (defvar-local emacs-dsh--cursor -1)
@@ -187,6 +194,9 @@ The fallback is used only when the Host does not offer auto."
   "Call DSH Remote ENDPOINT with named ARGS; pass result/error to CALLBACK.
 CALLBACK receives (VALUE ERROR), exactly once.  Always execute it in the
 buffer that initiated the call, if that buffer is still alive."
+  (when (and emacs-dsh--source
+             (not (equal emacs-dsh--source (emacs-dsh--source-identity))))
+    (user-error "DSH chat belongs to another Host generation"))
   (let* ((origin (current-buffer))
          (id (emacs-dsh--uuid))
          (url (concat (emacs-dsh--base) "api/" endpoint))
@@ -552,6 +562,150 @@ An existing but invalid bridge must fail validation, not silently fall back."
                           emacs-dsh--authenticated-mode (and cookie mode))
                     (emacs-dsh--auth-finish error))))
              (error (emacs-dsh--auth-finish (error-message-string err)))))))))))
+
+(defun emacs-dsh--metadata-auth (callback)
+  "Authenticate to an existing Host only, without joining startup waiters."
+  (condition-case nil
+      (let* ((mode (emacs-dsh--effective-mode))
+             (connection
+              (pcase mode
+                ('desktop (emacs-dsh--bridge-launch))
+                ('managed
+                 (unless (and (process-live-p emacs-dsh--managed-process)
+                              emacs-dsh--managed-connection)
+                   (error "Managed Host is not running"))
+                 emacs-dsh--managed-connection)
+                (_ (error "Invalid connection mode")))))
+        (if emacs-dsh--auth-running
+            (funcall callback "Authentication is busy; retry metadata scan")
+          (if (and emacs-dsh--cookie-jar
+                   (equal (car connection) emacs-dsh--authenticated-base)
+                   (equal (caddr connection) emacs-dsh--authenticated-nonce)
+                   (eq mode emacs-dsh--authenticated-mode))
+              (funcall callback nil)
+            (setq emacs-dsh-url (car connection))
+            (emacs-dsh--exchange-token
+             (cadr connection)
+             (lambda (cookie failure)
+               (if (or failure (not (eq mode (emacs-dsh--effective-mode)))
+                       (and (eq mode 'managed)
+                            (not (equal connection emacs-dsh--managed-connection)))
+                       (and (eq mode 'desktop)
+                            (not (equal connection (emacs-dsh--bridge-launch))))
+                       emacs-dsh--auth-running)
+                   (funcall callback "Existing Host authentication failed or changed")
+                 (setq emacs-dsh--cookie-jar cookie
+                       emacs-dsh--authenticated-base (car connection)
+                       emacs-dsh--authenticated-nonce (caddr connection)
+                       emacs-dsh--authenticated-mode mode)
+                 (funcall callback nil)))))))
+    (error (funcall callback "Configured Host is unavailable; enumeration did not start it"))))
+
+;;;###autoload
+(cl-defun emacs-dsh-list-sessions (on-success &key on-error)
+  "Enumerate existing Host metadata without startup, cleanup or activation.
+ON-SUCCESS receives (:source HOST-IDENTITY :items RAW-ITEMS).  Missing
+metadata stays unknown; projection titles are not original user messages.
+ON-ERROR receives a diagnostic string.  Return a silent cancel function.
+Only session/list is requested.  Server-side read-only semantics still
+require validation against the configured Host version."
+  (let (done timer)
+    (cl-labels
+        ((finish (value failure)
+           (unless done
+             (setq done t)
+             (when timer (cancel-timer timer))
+             (if failure
+                 (if on-error (funcall on-error failure)
+                   (message "emacs-dsh: %s" failure))
+               (funcall on-success value)))))
+      (setq timer (run-at-time 30 nil #'finish nil "DSH metadata request timed out"))
+      (emacs-dsh--metadata-auth
+       (lambda (failure)
+         (unless done
+           (if failure (finish nil failure)
+             (let ((source (emacs-dsh--source-identity)))
+               (condition-case nil
+                   (emacs-dsh--request
+                "session/list" `((_request . ,(make-hash-table)))
+                (lambda (value error)
+                  (finish
+                   (list :source source :items (alist-get 'items value))
+                   (or error
+                       (unless (equal source (emacs-dsh--source-identity))
+                         "Host changed during metadata request")))))
+                 (error (finish nil "DSH metadata transport failed"))))))))
+      (lambda () (setq done t) (when timer (cancel-timer timer))))))
+
+;;;###autoload
+(cl-defun emacs-dsh-open-session
+    (session-id &key directory (display 'current) on-ready on-error)
+  "Restore exact SESSION-ID in DIRECTORY without a picker or cleanup.
+DISPLAY is `current', `none', or a `display-buffer' action.  This API is
+asynchronous: ON-READY receives a buffer after a matching Host snapshot;
+ON-ERROR receives a string.  Return a silent cancellation function.
+A missing snapshot ID or cwd is an error, never assumed successful."
+  (unless (and (stringp session-id) (not (string-empty-p session-id))
+               (stringp directory) (file-directory-p directory)
+               (not (file-remote-p directory)))
+    (user-error "An exact session ID and existing local directory are required"))
+  (let ((root (file-name-as-directory (expand-file-name directory)))
+        done timer poll)
+    (cl-labels
+        ((finish (buffer failure)
+           (unless done
+             (setq done t)
+             (when timer (cancel-timer timer))
+             (when poll (cancel-timer poll))
+             (if failure
+                 (if on-error (funcall on-error failure)
+                   (message "emacs-dsh: %s" failure))
+               (pcase display
+                 ('none nil)
+                 ('current (switch-to-buffer buffer))
+                 (_ (display-buffer buffer display)))
+               (when on-ready (funcall on-ready buffer)))))
+         (check (buffer source)
+           (unless done
+             (if (not (buffer-live-p buffer))
+                 (finish nil "DSH chat buffer was killed")
+               (with-current-buffer buffer
+                 (cond
+                  ((not (equal source (emacs-dsh--source-identity)))
+                   (finish nil "DSH Host changed during restore"))
+                  (emacs-dsh--verified-session
+                   (let ((id (car emacs-dsh--verified-session))
+                         (cwd (cadr emacs-dsh--verified-session)))
+                     (if (and (equal id session-id) (stringp cwd)
+                              (equal (directory-file-name (emacs-dsh--host-path root))
+                                     (directory-file-name cwd))
+                              emacs-dsh--socket
+                              (websocket-openp emacs-dsh--socket))
+                         (finish buffer nil)
+                       (finish nil "DSH snapshot session or directory cannot be verified"))))))))))
+      (setq timer (run-at-time 35 nil #'finish nil "DSH session restore timed out"))
+      (emacs-dsh--ensure-auth
+       (lambda (failure)
+         (unless done
+           (if failure (finish nil failure)
+             (condition-case nil
+                 (let* ((source (emacs-dsh--source-identity))
+                        (existing (gethash session-id emacs-dsh--chats)))
+                   (when (and (buffer-live-p existing)
+                              (not (equal source
+                                          (buffer-local-value 'emacs-dsh--source existing))))
+                     (error "Cannot reuse chat from another Host"))
+                   (let ((buffer (emacs-dsh--show session-id root 'none)))
+                     (with-current-buffer buffer
+                       (unless (and emacs-dsh--socket (websocket-openp emacs-dsh--socket))
+                         (setq emacs-dsh--verified-session nil)
+                         (emacs-dsh--follow)))
+                     (setq poll (run-at-time 0.01 0.05 #'check buffer source))))
+               (error (finish nil "DSH restore failed; check Host identity and connection")))))))
+      (lambda ()
+        (setq done t)
+        (when timer (cancel-timer timer))
+        (when poll (cancel-timer poll))))))
 
 ;;;###autoload
 (defun emacs-dsh-connect ()
@@ -1703,6 +1857,11 @@ code indentation and the raw answer used by /copy unchanged."
                    (let ((value (alist-get 'value data)))
                      (pcase (alist-get 'type value)
                        ("snapshot"
+                         (setq emacs-dsh--verified-session
+                               (let ((header (alist-get 'header value)))
+                                 (list (or (alist-get 'sessionId header)
+                                           (alist-get 'id header))
+                                       (alist-get 'cwd header))))
                         (when-let* ((created (alist-get 'createdAt
                                                        (alist-get 'header value))))
                           (puthash emacs-dsh--session-id created emacs-dsh--created-at))
@@ -1964,6 +2123,10 @@ MAX-MESSAGES limits history included in the first snapshot."
                                                (cons 'assistantStream t)))))))))))
 
 (defun emacs-dsh--follow ()
+  (when (and emacs-dsh--source
+             (not (equal emacs-dsh--source (emacs-dsh--source-identity))))
+    (user-error "DSH chat belongs to another Host generation"))
+  (setq emacs-dsh--verified-session nil)
   (when emacs-dsh--session-id
     (when emacs-dsh--retry-timer
       (cancel-timer emacs-dsh--retry-timer)
@@ -2050,20 +2213,24 @@ MAX-MESSAGES limits history included in the first snapshot."
    (lambda (failure)
      (message "emacs-dsh: model selection unavailable: %s" failure))))
 
-(defun emacs-dsh--show (id root)
+(defun emacs-dsh--show (id root &optional display)
   (let* ((local-root (emacs-dsh--local-path root))
          (root (if (and local-root (file-directory-p local-root))
                    local-root (emacs-dsh--project-root)))
-         (existing (gethash id emacs-dsh--chats)))
+         (existing (gethash id emacs-dsh--chats))
+         (original (current-buffer))
+         (target nil))
     (if (buffer-live-p existing)
-        (switch-to-buffer existing)
+        (progn (setq target existing) (set-buffer existing))
       (let* ((directory (file-name-nondirectory (directory-file-name root)))
              (buffer (generate-new-buffer
                       (format "*emacs-dsh:%s*"
                               (if (string-empty-p directory) "/" directory)))))
         (puthash id buffer emacs-dsh--chats)
-        (switch-to-buffer buffer)
+        (setq target buffer)
+        (set-buffer buffer)
         (emacs-dsh-chat-mode)
+        (setq-local emacs-dsh--source (emacs-dsh--source-identity))
         (setq-local default-directory (file-name-as-directory root))
         (setq-local emacs-dsh--root root)
         (setq-local emacs-dsh--session-id id)
@@ -2071,7 +2238,13 @@ MAX-MESSAGES limits history included in the first snapshot."
         (emacs-dsh--follow)
         (emacs-dsh--events-connect)
         (emacs-dsh--refresh-model-selection)))
-    (delete-other-windows)))
+    (set-buffer original)
+    (pcase display
+      ('none nil)
+      ('current (switch-to-buffer target))
+      ('nil (switch-to-buffer target) (delete-other-windows))
+      (_ (display-buffer target display)))
+    target))
 
 (defconst emacs-dsh--preset-names
   '(("standard" . "Standard") ("code" . "PTC")

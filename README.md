@@ -2,6 +2,9 @@
 
 English | [简体中文](README.zh-CN.md)
 
+Development integration APIs: [enumerate and restore sessions](PUBLIC-API.md)
+(including unverified Host contracts and current limitations).
+
 An Emacs client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH), with an interaction style inspired by [pimacs.el](https://github.com/ananthakumaran/pimacs.el). Create and resume sessions, stream responses, switch models and reasoning effort, run slash commands and skills, manage queued prompts, complete file and cross-session references, and attach images. Authentication is automatic: no username, password, or manually pasted token is required.
 
 ## Connection modes
