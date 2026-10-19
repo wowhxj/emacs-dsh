@@ -2340,55 +2340,112 @@ CHOOSE-MODE asks for an agent preset only if a new session is selected."
        (lambda (preset) (emacs-dsh--create-session root preset)))
     (emacs-dsh--create-session root "standard")))
 
-(defun emacs-dsh--set-default-permission (session catalog root)
-  "Set SESSION permission from CATALOG before displaying chat ROOT."
+(defun emacs-dsh--set-default-permission (session catalog root &optional on-created)
+  "Set SESSION permission from CATALOG, then show ROOT or call ON-CREATED."
   (let ((permission (if (and (equal emacs-dsh-default-permission "auto")
                              (not (cl-find "auto" (alist-get 'options catalog)
                                            :key (lambda (option) (alist-get 'value option))
                                            :test #'equal)))
                         "danger-full-access" emacs-dsh-default-permission)))
-    (emacs-dsh--call
-     "commands/execute"
-     `((agentId . ,session) (line . ,(concat "/permission " permission))
-       (submittedAttachments . []))
-     (lambda (value)
-       (let ((result (alist-get 'result value)))
-         (emacs-dsh--show session root)
-         (unless (equal (alist-get 'kind result) "success")
-           (message "emacs-dsh: default permission %s was not accepted" permission))))
-     (lambda (failure)
-       (emacs-dsh--show session root)
-       (message "emacs-dsh: default permission unavailable: %s" failure)))))
+    (cl-labels ((show ()
+                  (if on-created (funcall on-created session root)
+                    (emacs-dsh--show session root))))
+      (emacs-dsh--call
+       "commands/execute"
+       `((agentId . ,session) (line . ,(concat "/permission " permission))
+         (submittedAttachments . []))
+       (lambda (value)
+         (show)
+         (unless (equal (alist-get 'kind (alist-get 'result value)) "success")
+           (message "emacs-dsh: default permission %s was not accepted" permission)))
+       (lambda (failure)
+         (show)
+         (message "emacs-dsh: default permission unavailable: %s" failure))))))
 
-(defun emacs-dsh--create-session (root preset)
-  "Create a session in ROOT's Host workspace with optional PRESET.
-The workspace groups it with Desktop sessions of the same directory; a Host
-without workspaces gets a plain cwd session, shown there as ungrouped."
+(defun emacs-dsh--create-session (root preset &optional on-created on-error)
+  "Create in ROOT's Host workspace using PRESET and optional callbacks."
   (let ((path (emacs-dsh--host-path (directory-file-name root))))
     (emacs-dsh--call
      "workspace/create" `((request . ((path . ,path))))
      (lambda (value)
        (emacs-dsh--create-session-in
         `((workspaceId . ,(alist-get 'workspaceId (alist-get 'workspace value))))
-        root preset))
+        root preset on-created on-error))
      (lambda (failure)
-       (message "emacs-dsh: workspace unavailable, session will be ungrouped: %s"
-                failure)
-       (emacs-dsh--create-session-in `((cwd . ,path)) root preset)))))
+       (message "emacs-dsh: workspace unavailable, session will be ungrouped: %s" failure)
+       (emacs-dsh--create-session-in `((cwd . ,path)) root preset on-created on-error)))))
 
-(defun emacs-dsh--create-session-in (place root preset)
-  "Create a session at PLACE (workspaceId or cwd) for chat ROOT with PRESET."
+(defun emacs-dsh--create-session-in (place root preset &optional on-created on-error)
+  "Create at PLACE for ROOT with PRESET, then display or call ON-CREATED."
   (emacs-dsh--call
    "session/create"
    `((request . ,(append place (when preset `((agentPreset . ,preset))))))
    (lambda (value)
      (let ((session (alist-get 'sessionId value)))
-       (emacs-dsh--call
-        "permissionPresets/catalog" (make-hash-table)
-        (lambda (catalog)
-          (emacs-dsh--set-default-permission session catalog root))
-        (lambda (_failure)
-          (emacs-dsh--set-default-permission session nil root)))))))
+       (if (not (and (stringp session) (not (string-empty-p session))))
+           (if on-error (funcall on-error "Host omitted the created session ID")
+             (message "emacs-dsh: Host omitted the created session ID"))
+         (emacs-dsh--call
+          "permissionPresets/catalog" (make-hash-table)
+          (lambda (catalog) (emacs-dsh--set-default-permission session catalog root on-created))
+          (lambda (_failure) (emacs-dsh--set-default-permission session nil root on-created))))))
+   on-error))
+
+;;;###autoload
+(cl-defun emacs-dsh-create-session
+    (directory &key (display 'current) on-ready on-error)
+  "Create a standard session in existing local DIRECTORY without a picker.
+Use normal workspace/permission setup and verify the new session through
+follow.  No user prompt is sent.  Return a cancellation function; cancelling
+suppresses callbacks, not an already sent create request."
+  (unless (and (stringp directory) (not (file-remote-p directory))
+               (file-directory-p directory))
+    (user-error "An existing local project directory is required"))
+  (let ((root (file-name-as-directory (file-truename directory)))
+        (origin (current-buffer))
+        (operation (generate-new-buffer " *dsh-session-create*"))
+        done timer cancel-open identity)
+    (cl-labels
+        ((finish (buffer failure)
+           (unless done
+             (setq done t)
+             (when timer (cancel-timer timer))
+             (when (buffer-live-p operation) (kill-buffer operation))
+             (when (buffer-live-p origin)
+               (with-current-buffer origin
+                 (if failure
+                     (if on-error (funcall on-error failure) (message "emacs-dsh: %s" failure))
+                   (when on-ready (funcall on-ready buffer))))))))
+      (setq timer (run-at-time 45 nil #'finish nil "DSH creation timed out; a session may already exist"))
+      (with-current-buffer operation
+        (condition-case err
+            (emacs-dsh--ensure-auth
+             (lambda (failure)
+               (unless done
+                 (if failure (finish nil failure)
+                   (setq identity (emacs-dsh--source-identity))
+                   (setq-local emacs-dsh--source identity)
+                   (emacs-dsh--create-session
+                    root "standard"
+                    (lambda (id _directory)
+                      (unless done
+                        (if (not (equal identity (emacs-dsh--source-identity)))
+                            (finish nil "Host changed during session creation")
+                          (setq cancel-open
+                                (emacs-dsh-open-session
+                                 id :directory root :display display
+                                 :on-ready (lambda (buffer)
+                                             (if (equal identity (emacs-dsh--source-identity))
+                                                 (finish buffer nil)
+                                               (finish nil "Host changed before readiness")))
+                                 :on-error (lambda (error) (finish nil error)))))))
+                    (lambda (error) (finish nil error)))))))
+          (error (finish nil (error-message-string err)))))
+      (lambda ()
+        (setq done t)
+        (when timer (cancel-timer timer))
+        (when (functionp cancel-open) (funcall cancel-open))
+        (when (buffer-live-p operation) (kill-buffer operation))))))
 
 ;;;###autoload
 (defun emacs-dsh-select-mode ()

@@ -75,5 +75,58 @@
       (funcall reply '((items . nil)) nil)
       (should-not result))))
 
+(ert-deftest emacs-dsh-api-create-uses-normal-setup-without-picker-or-prompt ()
+  (let ((root (make-temp-file "dsh-create-api-" t)) (buffer (generate-new-buffer " *dsh-created*"))
+        (original (window-buffer)) endpoints ready failure)
+    (unwind-protect
+        (cl-letf (((symbol-function 'emacs-dsh--ensure-auth) (lambda (callback) (funcall callback nil)))
+                  ((symbol-function 'emacs-dsh--source-identity) (lambda () '("host" "nonce" desktop)))
+                  ((symbol-function 'completing-read) (lambda (&rest _) (ert-fail "Unexpected picker")))
+                  ((symbol-function 'emacs-dsh--show) (lambda (&rest _) (ert-fail "Creation bypassed public open")))
+                  ((symbol-function 'emacs-dsh--call)
+                   (lambda (endpoint args success &optional _on-error)
+                     (should (equal emacs-dsh--source '("host" "nonce" desktop)))
+                     (push endpoint endpoints)
+                     (pcase endpoint
+                       ("workspace/create" (funcall success '((workspace . ((workspaceId . "w"))))))
+                       ("session/create"
+                        (should (equal (alist-get 'agentPreset (alist-get 'request args)) "standard"))
+                        (funcall success '((sessionId . "fresh"))))
+                       ("permissionPresets/catalog" (funcall success '((options . (((value . "auto")))))))
+                       ("commands/execute"
+                        (should (string-prefix-p "/permission " (alist-get 'line args)))
+                        (funcall success '((result . ((kind . "success"))))))
+                       (_ (ert-fail endpoint)))))
+                  ((symbol-function 'emacs-dsh-open-session)
+                   (lambda (id &rest args)
+                     (should (equal id "fresh"))
+                     (should (equal (plist-get args :directory) (file-name-as-directory (file-truename root))))
+                     (should (eq (plist-get args :display) 'none))
+                     (funcall (plist-get args :on-ready) buffer)
+                     #'ignore)))
+          (emacs-dsh-create-session root :display 'none
+                                    :on-ready (lambda (value) (setq ready value))
+                                    :on-error (lambda (error) (setq failure error)))
+          (should-not failure) (should (eq ready buffer))
+          (should (eq original (window-buffer)))
+          (should (equal (reverse endpoints) '("workspace/create" "session/create" "permissionPresets/catalog" "commands/execute"))))
+      (kill-buffer buffer) (delete-directory root))))
+
+(ert-deftest emacs-dsh-api-create-cancel-and-host-change-do-not-open ()
+  (dolist (action '(cancel host-change))
+    (let ((root (make-temp-file "dsh-create-boundary-" t))
+          (identity '("host" "nonce" desktop)) complete failure)
+      (unwind-protect
+          (cl-letf (((symbol-function 'emacs-dsh--ensure-auth) (lambda (callback) (funcall callback nil)))
+                    ((symbol-function 'emacs-dsh--source-identity) (lambda () identity))
+                    ((symbol-function 'emacs-dsh--create-session)
+                     (lambda (_root _preset callback &optional _failure) (setq complete callback)))
+                    ((symbol-function 'emacs-dsh-open-session) (lambda (&rest _) (ert-fail "Opened cancelled/wrong Host session"))))
+            (let ((cancel (emacs-dsh-create-session root :on-error (lambda (error) (setq failure error)))))
+              (if (eq action 'cancel) (funcall cancel) (setq identity '("other" "nonce" desktop)))
+              (funcall complete "fresh" root)
+              (if (eq action 'cancel) (should-not failure) (should (string-match-p "Host changed" failure)))))
+        (delete-directory root)))))
+
 (provide 'public-api-tests)
 ;;; public-api-tests.el ends here

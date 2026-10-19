@@ -1,5 +1,22 @@
 # Public session APIs (development)
 
+## Create without a history picker
+
+```elisp
+(emacs-dsh-create-session
+ "/absolute/project" :display 'none
+ :on-ready (lambda (buffer) (pop-to-buffer buffer))
+ :on-error (lambda (error) (message "%s" error)))
+```
+
+Creation is an explicit write action. The directory must exist and be local.
+It uses the ordinary standard preset, workspace and configured default
+permission setup, then verifies the created ID/directory through the existing
+open API. No user prompt is sent. Host generation is pinned during the
+operation. The returned cancellation function suppresses callbacks; it does
+not undo a create request already sent, delete the session, or stop its chat.
+
+
 ```elisp
 (emacs-dsh-list-sessions
  (lambda (result) (message "%S" result))
