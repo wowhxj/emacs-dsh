@@ -85,6 +85,11 @@ and on macOS, nil sends paths unchanged."
 (defcustom emacs-dsh-max-messages 100
   "Number of messages in the first history snapshot."
   :type 'integer :group 'emacs-dsh)
+(defcustom emacs-dsh-reference-providers nil
+  "Alist of (NAME . FUNCTION) for external @NAME references.
+TAB on @NAME calls FUNCTION with the chat root.  It returns a file path to
+insert as an @ reference, or nil to leave the draft unchanged."
+  :type '(alist :key-type string :value-type function) :group 'emacs-dsh)
 (defcustom emacs-dsh-show-reasoning t
   "Whether to show assistant reasoning as collapsed Thinking steps."
   :type 'boolean :group 'emacs-dsh)
@@ -706,6 +711,124 @@ A missing snapshot ID or cwd is an error, never assumed successful."
         (setq done t)
         (when timer (cancel-timer timer))
         (when poll (cancel-timer poll))))))
+
+(defun emacs-dsh--snapshot-dialogue (snapshot)
+  "Return user and assistant text in follow SNAPSHOT, in event order.
+Each item is (:role user|assistant :text TEXT :time TIME).  Tool calls,
+tool results, reasoning and non-user injected messages are omitted."
+  (let (messages)
+    (dolist (record (alist-get 'records snapshot))
+      (let* ((event (alist-get 'event record))
+             (data (alist-get 'data event))
+             (message (or (alist-get 'message data) data))
+             (blocks (alist-get 'content message))
+             (blocks (cl-remove-if (lambda (block)
+                                     (member (alist-get 'type block)
+                                             '("reasoning" "tool-call" "tool-result")))
+                                   (if (vectorp blocks) (append blocks nil) blocks)))
+             (source (alist-get 'source message))
+             (role (pcase (alist-get 'type event)
+                     ("user/message"
+                      (when (or (not source) (equal (alist-get 'kind source) "user"))
+                        'user))
+                     ("assistant/message" 'assistant)))
+             (text (and role (emacs-dsh--assistant-display-text
+                              (emacs-dsh--content blocks)))))
+        (when (and text (not (string-empty-p text)))
+          (push (list :role role :text text :time (alist-get 'time event)) messages))))
+    (nreverse messages)))
+
+;;;###autoload
+(cl-defun emacs-dsh-read-session
+    (session-id on-success &key on-error (max-messages emacs-dsh-max-messages))
+  "Read SESSION-ID's latest saved dialogue from an existing Host.
+Like `emacs-dsh-list-sessions', never start a Host, open a chat buffer or
+send a prompt.  ON-SUCCESS receives (:source HOST-IDENTITY :session-id ID
+:cwd CWD :title TITLE :max-messages N :messages MESSAGES), where MESSAGES is
+described in `emacs-dsh--snapshot-dialogue'.  The Host snapshot holds only
+the latest MAX-MESSAGES messages; older pages are not requested.  ON-ERROR
+receives a string.  Return a silent cancellation function."
+  (unless (and (stringp session-id) (not (string-empty-p session-id)))
+    (user-error "An exact session ID is required"))
+  (let (done timer socket)
+    (cl-labels
+        ((finish (value failure)
+           (unless done
+             (setq done t)
+             (when timer (cancel-timer timer))
+             (when socket (ignore-errors (websocket-close socket)))
+             (if failure
+                 (if on-error (funcall on-error failure)
+                   (message "emacs-dsh: %s" failure))
+               (funcall on-success value))))
+         (snapshot (source value)
+           (let* ((header (alist-get 'header value))
+                  (id (or (alist-get 'sessionId header) (alist-get 'id header))))
+             (cond
+              ((not (equal id session-id))
+               (finish nil "DSH snapshot session cannot be verified"))
+              ((not (equal source (emacs-dsh--source-identity)))
+               (finish nil "Host changed during session read"))
+              (t (finish (list :source source :session-id id
+                               :cwd (alist-get 'cwd header)
+                               :title (alist-get 'title (alist-get 'values (alist-get 'projections value)))
+                               :max-messages max-messages
+                               :messages (emacs-dsh--snapshot-dialogue value))
+                         nil))))))
+      (setq timer (run-at-time 30 nil #'finish nil "DSH session read timed out"))
+      (emacs-dsh--metadata-auth
+       (lambda (failure)
+         (unless done
+           (if failure (finish nil failure)
+             (condition-case err
+                 (let* ((source (emacs-dsh--source-identity))
+                        (base (emacs-dsh--base))
+                        (scheme (if (string-prefix-p "https:" base) "wss" "ws"))
+                        (url (concat scheme (substring base (if (equal scheme "wss") 5 4))
+                                     "api/remote.mux"))
+                        (url-cookie-storage nil)
+                        (url-cookie-secure-storage nil))
+                   (setq socket
+                         (websocket-open
+                          url
+                          :custom-header-alist
+                          (and emacs-dsh--cookie-jar
+                               (list (cons "Cookie" emacs-dsh--cookie-jar)))
+                          :on-open
+                          (lambda (ws)
+                            (websocket-send-text
+                             ws (emacs-dsh--follow-payload session-id max-messages)))
+                          :on-message
+                          (lambda (ws frame)
+                            ;; Close the delivering socket even if it reports
+                            ;; before `websocket-open' has returned it.
+                            (setq socket ws)
+                            (condition-case err
+                                (let* ((data (json-parse-string
+                                              (websocket-frame-payload frame)
+                                              :object-type 'alist :array-type 'list
+                                              :null-object nil :false-object nil))
+                                       (value (alist-get 'value data)))
+                                  (when (equal (alist-get 'streamId data) session-id)
+                                    (pcase (alist-get 'type data)
+                                      ("error"
+                                       (finish nil (format "DSH session read failed: %s"
+                                                           (alist-get 'message (alist-get 'error data)))))
+                                      ("item"
+                                       (when (equal (alist-get 'type value) "snapshot")
+                                         (snapshot source value))))))
+                              (error (finish nil (format "DSH session frame: %s"
+                                                         (error-message-string err))))))
+                          :on-error (lambda (_ws _phase error)
+                                      (finish nil (format "DSH WebSocket: %s" error)))
+                          :on-close (lambda (_ws)
+                                      (finish nil "DSH WebSocket closed before a snapshot")))))
+               (error (finish nil (format "DSH session transport failed: %s"
+                                          (error-message-string err)))))))))
+      (lambda ()
+        (setq done t)
+        (when timer (cancel-timer timer))
+        (when socket (ignore-errors (websocket-close socket)))))))
 
 ;;;###autoload
 (defun emacs-dsh-connect ()
@@ -3702,6 +3825,11 @@ messages carrying images or files cannot be edited."
                   (start (match-beginning 1)))
               (list :kind 'session :start start :end offset :original raw
                     :query (string-trim-left (substring raw 8)))))
+           ((and (string-match "\\(?:\\`\\|[[:space:]]\\)\\(@\\([[:alnum:]_-]+\\)\\)\\'" head)
+                 (assoc (match-string 2 head) emacs-dsh-reference-providers))
+            (list :kind 'provider :start (match-beginning 1) :end offset
+                  :original (match-string 1 head)
+                  :provider (cdr (assoc (match-string 2 head) emacs-dsh-reference-providers))))
            ((string-match
              "\\(?:\\`\\|[[:space:]]\\)\\(@\\(?:\"[^\"]*\\|[^[:space:]\" ]*\\)\\)\\'"
              head)
@@ -3948,6 +4076,11 @@ messages carrying images or files cannot be edited."
     (pcase (plist-get context :kind)
       ('file (emacs-dsh--complete-host-file context))
       ('session (emacs-dsh--complete-session-reference context))
+      ('provider
+       (when-let* ((path (funcall (plist-get context :provider) emacs-dsh--root)))
+         (emacs-dsh--replace-completion
+          context (or (emacs-dsh--file-mention path)
+                      (user-error "Reference path cannot be quoted: %s" path)))))
       ('slash (emacs-dsh--complete-slash context))
       (_ (message "emacs-dsh: TAB completes @files, @session and /commands")))))
 
@@ -3958,11 +4091,12 @@ messages carrying images or files cannot be edited."
         (concat "@\"" escaped "\"") (concat "@" escaped))))
 
 ;;;###autoload
-(defun emacs-dsh-insert-file ()
-  "Insert a @file reference relative to the current chat root."
+(defun emacs-dsh-insert-file (&optional path)
+  "Insert a @file reference to PATH relative to the current chat root.
+Interactively, or when PATH is nil, read the file name."
   (interactive)
   (unless emacs-dsh--root (user-error "Not in a DSH chat"))
-  (let ((path (read-file-name "Reference file: " emacs-dsh--root nil t)))
+  (let ((path (or path (read-file-name "Reference file: " emacs-dsh--root nil t))))
     (emacs-dsh--replace-draft
      (concat (emacs-dsh--draft-text) " " (emacs-dsh--file-ref path emacs-dsh--root)))))
 

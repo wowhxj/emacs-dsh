@@ -54,7 +54,34 @@ interactive commands retain their full-window default. Buffer reuse is
 rejected across different authenticated Host generations. This is not a
 multi-Host connection manager.
 
+## Reading a saved dialogue
+
+```elisp
+(emacs-dsh-read-session
+ "FULL-SESSION-ID" (lambda (value) (message "%S" (plist-get value :messages)))
+ :on-error (lambda (error) (message "%s" error)) :max-messages 1000)
+```
+
+Like enumeration, reading authenticates only to an existing Host and never
+starts one, opens a chat buffer or sends a prompt. It opens one temporary
+`session/follow` stream, takes the first snapshot and closes the socket.
+The result is `(:source :session-id :cwd :title :max-messages :messages)`;
+each message is `(:role user|assistant :text TEXT :time TIME)`. Tool calls,
+tool results, reasoning and non-user injected messages are omitted. A
+snapshot without the requested session ID is an error. Only the latest
+MAX-MESSAGES Host messages are available; older pages are not requested.
+
+## External @ references
+
+`emacs-dsh-reference-providers` maps a name to a function. `TAB` on `@NAME`
+calls it with the chat root; a returned file path replaces `@NAME` with an
+@file reference. `emacs-dsh-insert-file` also accepts a path argument.
+
 ## Unverified contracts and remaining work
+
+- `emacs-dsh-read-session` has not been run against an actual Host; whether
+  a follow stream has server-side effects (for example read markers) is not
+  verified. Tests cover the client protocol only.
 
 - The current Host version's server-side no-management-write guarantee for
   `session/list` has not been source-verified. Tests prove client endpoint

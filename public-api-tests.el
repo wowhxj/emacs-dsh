@@ -128,5 +128,118 @@
               (if (eq action 'cancel) (should-not failure) (should (string-match-p "Host changed" failure)))))
         (delete-directory root)))))
 
+(defconst emacs-dsh-api-test-snapshot
+  (json-serialize
+   '((type . "snapshot")
+     (header . ((sessionId . "s") (cwd . "/work")))
+     (projections . ((values . ((title . "T")))))
+     (records
+      . [((event . ((seq . 1) (type . "user/message") (time . 10)
+                    (data . ((message . ((content . [((type . "text") (text . "hi"))]))))))))
+         ((event . ((seq . 2) (type . "user/message")
+                    (data . ((message . ((source . ((kind . "agent")))
+                                         (content . [((type . "text") (text . "injected"))]))))))))
+         ((event . ((seq . 3) (type . "tool/call") (data . ((name . "bash"))))))
+         ((event . ((seq . 4) (type . "assistant/message") (time . 11)
+                    (data . ((message . ((content . [((type . "reasoning") (text . "think"))
+                                                     ((type . "tool-call") (name . "bash"))
+                                                     ((type . "text") (text . "\nhello\n"))]))))))))
+         ((event . ((seq . 5) (type . "assistant/message")
+                    (data . ((message . ((content . [((type . "text") (text . "  "))]))))))))])))
+  "A follow snapshot frame value, as JSON text from the Host.")
+
+(defun emacs-dsh-api-test-parse (json)
+  "Parse Host JSON like the client's frame handlers."
+  (json-parse-string json :object-type 'alist :array-type 'list
+                     :null-object nil :false-object nil))
+
+(ert-deftest emacs-dsh-api-snapshot-dialogue-keeps-only-user-and-assistant-text ()
+  (should (equal (emacs-dsh--snapshot-dialogue (emacs-dsh-api-test-parse emacs-dsh-api-test-snapshot))
+                 '((:role user :text "hi" :time 10)
+                   (:role assistant :text "hello" :time 11)))))
+
+(ert-deftest emacs-dsh-api-read-does-not-start-managed-host ()
+  (let ((emacs-dsh-connection-mode 'managed)
+        emacs-dsh--managed-process emacs-dsh--managed-connection failure)
+    (cl-letf (((symbol-function 'emacs-dsh--managed-start)
+               (lambda (&rest _) (ert-fail "Session read started Host")))
+              ((symbol-function 'websocket-open)
+               (lambda (&rest _) (ert-fail "Unavailable Host was queried"))))
+      (emacs-dsh-read-session "s" (lambda (_) (ert-fail "Unavailable Host succeeded"))
+                              :on-error (lambda (err) (setq failure err)))
+      (should (stringp failure)))))
+
+(defun emacs-dsh-api-test-read (snapshot)
+  "Run `emacs-dsh-read-session' against fake SNAPSHOT; return (RESULT FAILURE SENT CLOSED)."
+  (let (result failure sent closed)
+    (cl-letf (((symbol-function 'emacs-dsh--metadata-auth) (lambda (cb) (funcall cb nil)))
+              ((symbol-function 'emacs-dsh--base) (lambda () "http://localhost:1/"))
+              ((symbol-function 'emacs-dsh--source-identity) (lambda () 'host))
+              ((symbol-function 'websocket-send-text) (lambda (_ws text) (push text sent)))
+              ((symbol-function 'websocket-close) (lambda (_ws) (setq closed t)))
+              ((symbol-function 'websocket-open)
+               (lambda (url &rest args)
+                 (should (equal url "ws://localhost:1/api/remote.mux"))
+                 (funcall (plist-get args :on-open) 'ws)
+                 (funcall (plist-get args :on-message) 'ws
+                          (make-websocket-frame
+                           :opcode 'text
+                           :payload (format "{\"streamId\":\"s\",\"type\":\"item\",\"value\":%s}"
+                                            snapshot)))
+                 'ws)))
+      (emacs-dsh-read-session "s" (lambda (value) (setq result value))
+                              :on-error (lambda (err) (setq failure err))
+                              :max-messages 7))
+    (list result failure sent closed)))
+
+(ert-deftest emacs-dsh-api-read-returns-verified-snapshot-dialogue ()
+  (pcase-let ((`(,result ,failure ,sent ,closed)
+               (emacs-dsh-api-test-read emacs-dsh-api-test-snapshot)))
+    (should-not failure)
+    (should closed)
+    (should (string-match-p "\"maxMessages\":7" (car sent)))
+    (should (equal (plist-get result :session-id) "s"))
+    (should (equal (plist-get result :cwd) "/work"))
+    (should (equal (plist-get result :title) "T"))
+    (should (eq (plist-get result :source) 'host))
+    (should (= (plist-get result :max-messages) 7))
+    (should (= (length (plist-get result :messages)) 2))))
+
+(ert-deftest emacs-dsh-api-read-rejects-unverified-session ()
+  (pcase-let ((`(,result ,failure ,_sent ,closed)
+               (emacs-dsh-api-test-read "{\"type\":\"snapshot\",\"header\":{\"cwd\":\"/w\"}}")))
+    (should-not result)
+    (should closed)
+    (should (string-match-p "verified" failure))))
+
+(ert-deftest emacs-dsh-api-reference-provider-replaces-at-name ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (setq-local emacs-dsh--root "/tmp/" emacs-dsh--session-id "s1")
+    (emacs-dsh--compose)
+    (let ((emacs-dsh-reference-providers
+           (list (cons "ashub" (lambda (root)
+                                 (should (equal root "/tmp/"))
+                                 "/cache/ref one.md")))))
+      (emacs-dsh--replace-draft "see @ashub")
+      (emacs-dsh-focus-input)
+      (should (eq (plist-get (emacs-dsh--completion-context) :kind) 'provider))
+      (cl-letf (((symbol-function 'emacs-dsh--call)
+                 (lambda (&rest _) (ert-fail "Provider reference queried the Host"))))
+        (emacs-dsh-complete))
+      (should (equal (emacs-dsh--draft-text) "see @\"/cache/ref one.md\"")))
+    (emacs-dsh--replace-draft "see @ashub")
+    (emacs-dsh-focus-input)
+    (should (eq (plist-get (emacs-dsh--completion-context) :kind) 'file))))
+
+(ert-deftest emacs-dsh-api-insert-file-accepts-path ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (setq-local emacs-dsh--root "/tmp/" emacs-dsh--session-id "s1")
+    (emacs-dsh--compose)
+    (emacs-dsh--replace-draft "see")
+    (emacs-dsh-insert-file "/tmp/x.md")
+    (should (equal (emacs-dsh--draft-text) "see @x.md"))))
+
 (provide 'public-api-tests)
 ;;; public-api-tests.el ends here
