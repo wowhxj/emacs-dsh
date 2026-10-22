@@ -60,7 +60,7 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 | --- | --- |
 | `M-x emacs-dsh-chat` 或 `<f7>` | 选择目录后，可继续该目录下已有会话或选择「新建会话」；若该目录没有会话则直接新建。与 `/resume` 相同，空闲的空白会话会被归档，不出现在列表中。新会话会加入该目录对应的 Host 工作区（不存在时自动创建），在 DSH 桌面端显示在该文件夹下，而不是「未分组」。新会话默认使用 **Standard** 模式；`C-u M-x emacs-dsh-chat` 可在新建前选择其他模式 |
 | `C-c C-r` 或 `/resume` | 列表显示前自动归档明确为空闲且从未开始对话的会话，再在 minibuffer 中搜索 Host 列出的其余会话（可用 Vertico/Orderless）；显示最近活动时间并按其降序排列；session ID 和工作目录采用中间省略、保留头尾的方式显示，并尽量为首句交互留出空间。状态未知或仍打开着 Emacs 聊天 buffer 的会话会保留；归档可在 Host 中恢复。恢复后关闭原聊天 buffer（未发送的输入会先确认） |
-| `i`（光标不在输入框时） | 跳到输入框已有文字末尾；在输入框内仍正常输入 `i` |
+| `C-c C-t` / `C-c C-j` | 进入 transcript 复制模式 / 返回输入区（semi-char mode） |
 | `M-p` / `M-n` | 上翻／下翻当前会话的用户 prompt 历史；下翻到末尾会恢复未发送的草稿 |
 | `RET` 或 `C-c C-c` | 发送输入 |
 | `Shift-Enter` | 在输入框插入换行，不发送 |

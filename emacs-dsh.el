@@ -886,6 +886,8 @@ receives a string.  Return a silent cancellation function."
     (define-key map (kbd "C-c C-l") #'emacs-dsh-queue)
     (define-key map (kbd "C-c C-p") #'emacs-dsh-paste)
     (define-key map (kbd "C-c C-i") #'emacs-dsh-focus-input)
+    (define-key map (kbd "C-c C-t") #'emacs-dsh-copy-mode)
+    (define-key map (kbd "C-c C-j") #'emacs-dsh-semi-char-mode)
     (define-key map (kbd "C-c C-b") #'emacs-dsh-switch-chat)
     (define-key map (kbd "C-c C-o") #'emacs-dsh-open-image)
     (define-key map (kbd "C-a") #'emacs-dsh-beginning-of-line)
@@ -908,10 +910,18 @@ receives a string.  Return a silent cancellation function."
     map)
   "Keys used while editing a queued message in the chat composer.")
 
+(defvar emacs-dsh-copy-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-j") #'emacs-dsh-semi-char-mode)
+    (define-key map (kbd "C-a") #'move-beginning-of-line)
+    (define-key map (kbd "M-p") #'backward-paragraph)
+    (define-key map (kbd "M-n") #'forward-paragraph)
+    map)
+  "Keys for navigating and copying the DSH transcript.")
+
 (defvar emacs-dsh-chat-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map emacs-dsh-mode-map)
-    (define-key map (kbd "i") #'emacs-dsh-focus-input)
     map)
   "Keys in an emacs-dsh chat buffer.")
 
@@ -925,6 +935,28 @@ receives a string.  Return a silent cancellation function."
 (defvar emacs-dsh--queue-edit-input-keymap
   (make-composed-keymap (list emacs-dsh--queue-edit-keymap widget-field-keymap))
   "Widget keymap while editing a pending message.")
+
+(defvar-local emacs-dsh--copy-mode nil)
+
+(defun emacs-dsh-copy-mode ()
+  "Enter transcript navigation and copy mode."
+  (interactive)
+  (setq emacs-dsh--copy-mode t)
+  (setq-local minor-mode-overriding-map-alist
+              (assq-delete-all 'emacs-dsh--copy-mode minor-mode-overriding-map-alist))
+  (push (cons 'emacs-dsh--copy-mode emacs-dsh-copy-mode-map)
+        minor-mode-overriding-map-alist)
+  (force-mode-line-update t)
+  (message "DSH copy mode; C-c C-j returns to input"))
+
+(defun emacs-dsh-semi-char-mode ()
+  "Return to the DSH composer."
+  (interactive)
+  (setq emacs-dsh--copy-mode nil)
+  (setq-local minor-mode-overriding-map-alist
+              (assq-delete-all 'emacs-dsh--copy-mode minor-mode-overriding-map-alist))
+  (emacs-dsh-focus-input)
+  (force-mode-line-update t))
 
 (define-derived-mode emacs-dsh-chat-mode fundamental-mode "emacs-dsh"
   "Major mode for a DSH chat; compose in the editable field at the bottom."
@@ -1009,7 +1041,7 @@ receives a string.  Return a silent cancellation function."
   (let ((queued (cl-count 'queued emacs-dsh--queue-items :key #'car))
         (steering (cl-count 'steering emacs-dsh--queue-items :key #'car)))
     (propertize
-     (emacs-dsh--line-string (format " DSH %s%s%s"
+     (emacs-dsh--line-string (format " DSH %s%s%s%s"
                                      (cond (emacs-dsh--queue-edit "editing queue")
                                            ((eq emacs-dsh--command-inflight 'compact) "compacting")
                                            (emacs-dsh--waiting emacs-dsh--waiting)
@@ -1021,7 +1053,8 @@ receives a string.  Return a silent cancellation function."
                                          (format " %c" (aref "|/-\\" (mod emacs-dsh--spinner-index 4)))
                                        "")
                                      (if (or (> queued 0) (> steering 0))
-                                         (format " [S%d F%d]" steering queued) "")))
+                                         (format " [S%d F%d]" steering queued) "")
+                                     (if emacs-dsh--copy-mode " COPY" "")))
      'face 'emacs-dsh-status-face)))
 
 (defun emacs-dsh--set-running (running)
