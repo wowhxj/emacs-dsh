@@ -26,7 +26,8 @@
 (require 'browse-url)
 (require 'color)
 (declare-function w32-shell-execute "w32fns.c" (operation document &optional parameters show-flag))
-(defvar vertico-sort-function)          ; let-bound dynamically to keep our order
+(defvar vertico-sort-function)
+(defvar vertico-group-format)          ; let-bound dynamically to keep our order
 (defvar orderless-smart-case)          ; disabled only inside path completion
 (defvar emacs-dsh--local-commands)      ; catalog defined with completion below
 (defvar emacs-dsh--queue-buffer)        ; queue panel defined below
@@ -3992,7 +3993,17 @@ messages carrying images or files cannot be edited."
    `((agentId . ,emacs-dsh--session-id)
      (query . ,(plist-get context :query)))
    (lambda (sessions)
-     (emacs-dsh--show-reference-choices context nil sessions))
+     (when sessions
+       (emacs-dsh--call
+        "session/list" `((_request . ,(make-hash-table)))
+        (lambda (reply)
+          (emacs-dsh--show-reference-choices
+           context nil (emacs-dsh--session-reference-details
+                        sessions (alist-get 'items reply))))
+        (lambda (failure)
+          (message "emacs-dsh: session summaries unavailable: %s" failure)
+          (emacs-dsh--show-reference-choices context nil sessions))))
+     (unless sessions (emacs-dsh--show-reference-choices context nil nil)))
    (lambda (failure)
      (message "emacs-dsh: session candidates unavailable: %s" failure))))
 
@@ -4024,22 +4035,102 @@ messages carrying images or files cannot be edited."
         (complete-with-action action (delete-dups (mapcar #'car current))
                               input predicate)))))
 
-(defun emacs-dsh--session-reference-label (item)
-  "Format session ITEM in aligned title, directory and shortened ID columns."
-  (let* ((width (max 72 (window-body-width)))
-         (budget (- width 32))
-         (title-width (min 42 (/ budget 2)))
-         (path-width (min 44 (- budget title-width)))
-         (title (replace-regexp-in-string
-                 "[[:space:]]+" " "
-                 (or (alist-get 'displayTitle item) (alist-get 'label item) "untitled")))
-         (path (emacs-dsh--workspace-label item))
-         (short-title (emacs-dsh--middle-truncate title title-width))
-         (short-path (emacs-dsh--middle-truncate path path-width))
-         (id (emacs-dsh--middle-truncate (or (alist-get 'sessionId item) "?") 18)))
-    (concat short-title (make-string (max 0 (- title-width (string-width short-title))) ?\s)
-            "  " short-path (make-string (max 0 (- path-width (string-width short-path))) ?\s)
-            "  " id (make-string (max 0 (- 18 (string-width id))) ?\s) " [session]")))
+(defun emacs-dsh--session-reference-details (candidates items)
+  "Enrich Host CANDIDATES with user query previews from session list ITEMS.
+Ignore empty automatic turns in the Host outline.  Never substitute generated
+titles or general activity for user messages."
+  (let ((table (make-hash-table :test #'equal)))
+    (dolist (item items)
+      (puthash (alist-get 'sessionId item) item table))
+    (mapcar
+     (lambda (candidate)
+       (let* ((item (gethash (alist-get 'sessionId candidate) table))
+              (values (alist-get 'values (alist-get 'projections item)))
+              (prompts (delq nil
+                             (mapcar (lambda (turn)
+                                       (let ((prompt (alist-get 'prompt turn)))
+                                         (and (stringp prompt)
+                                              (not (string-empty-p (string-trim prompt)))
+                                              prompt)))
+                                     (alist-get 'turnOutline values))))
+              (stamp (alist-get 'lastPromptAt (alist-get 'sessionListMetadata values)))
+              (record (copy-alist candidate)))
+         (setf (alist-get 'firstUserQuery record) (car prompts)
+               (alist-get 'lastUserQuery record) (car (last prompts))
+               (alist-get 'lastUserTime record)
+               (and (numberp stamp) (seconds-to-time (/ stamp 1000.0))))
+         record))
+     candidates)))
+
+(defun emacs-dsh--session-reference-column (text width &optional face)
+  "Make TEXT a single-line column of display WIDTH, optionally using FACE."
+  (let ((column (truncate-string-to-width
+                 (string-trim (replace-regexp-in-string
+                               "[[:space:]\n\r]+" " " (or text "—")))
+                 width nil ?\s "…")))
+    (if face (propertize column 'face face) column)))
+
+(defun emacs-dsh--session-reference-choices (sessions &optional width)
+  "Return aligned reference choices for SESSIONS within display WIDTH.
+Sort by the last user interaction, prioritizing first/latest user queries.
+The first label carries a column header for completion UIs."
+  (let* ((seen (make-hash-table :test #'equal))
+         (records
+          (cl-loop for item in sessions
+                   for id = (alist-get 'sessionId item)
+                   for mention = (alist-get 'mention item)
+                   when (and (stringp id) (not (equal id emacs-dsh--session-id))
+                             (stringp mention) (string-prefix-p "@[" mention)
+                             (string-match-p "(dsh-session:" mention)
+                             (not (gethash id seen)))
+                   collect (progn (puthash id t seen) item)))
+         (ids (mapcar (lambda (item) (alist-get 'sessionId item)) records))
+         (id-width 12)
+         (width (or width (- (window-body-width (minibuffer-window)) 4))))
+    (while (not (= (length
+                    (delete-dups
+                     (mapcar (lambda (id)
+                               (substring id 0 (min id-width (length id))))
+                             ids)))
+                   (length ids)))
+      (cl-incf id-width))
+    (setq records
+          (cl-stable-sort records
+                          (lambda (a b)
+                            (time-less-p (or (alist-get 'lastUserTime b) '(0 0))
+                                         (or (alist-get 'lastUserTime a) '(0 0))))))
+    (let* ((project-width (if (>= width 120) (min 30 (/ width 6)) 0))
+           (query-space (max 12 (- width 16 id-width 9
+                                  (if (> project-width 0) (+ project-width 3) 0))))
+           (first-width (/ query-space 2))
+           (last-width (- query-space first-width))
+           (row (lambda (time first last project id &optional heading)
+                  (string-join
+                   (append
+                    (list (emacs-dsh--session-reference-column time 16)
+                          (emacs-dsh--session-reference-column first first-width)
+                          (emacs-dsh--session-reference-column last last-width))
+                    (when (> project-width 0)
+                      (list (emacs-dsh--session-reference-column
+                             (emacs-dsh--middle-truncate (or project "—") project-width)
+                             project-width (unless heading 'shadow))))
+                    (list (emacs-dsh--session-reference-column
+                           (substring id 0 (min id-width (length id)))
+                           id-width (unless heading 'shadow))))
+                   (propertize " │ " 'face 'shadow))))
+           (header (funcall row "最后交互" "用户首句" "用户末句" "项目" "ID" t)))
+      (cl-loop for item in records
+               for stamp = (alist-get 'lastUserTime item)
+               for label = (funcall row
+                                    (if stamp (format-time-string "%Y-%m-%d %H:%M" stamp)
+                                      "—")
+                                    (alist-get 'firstUserQuery item)
+                                    (alist-get 'lastUserQuery item)
+                                    (when-let* ((cwd (alist-get 'cwd item)))
+                                      (abbreviate-file-name cwd))
+                                    (alist-get 'sessionId item))
+               collect (cons (propertize label 'emacs-dsh-session-header header)
+                             (alist-get 'mention item))))))
 
 (defun emacs-dsh--reference-file-choice (item)
   "Format Host or local file ITEM with an explicit directory slash."
@@ -4058,10 +4149,7 @@ messages carrying images or files cannot be edited."
          (session-p (eq (plist-get context :kind) 'session))
          (choices
           (if session-p
-              (cl-loop for item in sessions for mention = (alist-get 'mention item)
-                       when (and (stringp mention) (string-prefix-p "@[" mention)
-                                 (string-match-p "(dsh-session:" mention))
-                       collect (cons (emacs-dsh--session-reference-label item) mention))
+              (emacs-dsh--session-reference-choices sessions)
             (delq nil (mapcar #'emacs-dsh--reference-file-choice files)))))
     (unless session-p
       (let ((matches (cl-remove-if-not
@@ -4080,13 +4168,19 @@ messages carrying images or files cannot be edited."
          (let* ((values (make-hash-table :test #'equal))
                 (collection
                  (if session-p
-                     (lambda (input predicate action)
-                       (if (eq action 'metadata)
-                           '(metadata (category . emacs-dsh-session)
-                                      (display-sort-function . identity)
-                                      (cycle-sort-function . identity))
-                         (complete-with-action action (mapcar #'car choices) input predicate)))
+                     (let ((header (get-text-property
+                                    0 'emacs-dsh-session-header (caar choices))))
+                       (completion-table-with-metadata
+                        choices
+                        `((category . emacs-dsh-session)
+                          (display-sort-function . identity)
+                          (cycle-sort-function . identity)
+                          (group-function . ,(lambda (candidate transform)
+                                               (if transform candidate header))))))
                    (emacs-dsh--reference-table root query choices values)))
+                ;; Column headers must not inherit Vertico's group decoration.
+                (vertico-group-format
+                 (if session-p "%s" (bound-and-true-p vertico-group-format)))
                 (completion-styles (append completion-styles
                                            (unless (memq 'substring completion-styles)
                                              '(substring))))
