@@ -915,6 +915,7 @@ receives a string.  Return a silent cancellation function."
 (defvar emacs-dsh-copy-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-j") #'emacs-dsh-semi-char-mode)
+    (define-key map (kbd "i") #'emacs-dsh-semi-char-mode)
     (define-key map (kbd "C-a") #'move-beginning-of-line)
     (define-key map (kbd "M-p") #'backward-paragraph)
     (define-key map (kbd "M-n") #'forward-paragraph)
