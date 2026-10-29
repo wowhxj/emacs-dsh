@@ -20,7 +20,8 @@
 
 (ert-deftest emacs-dsh-shortcuts-use-shared-mode-map-only ()
   (let ((global-resume (lookup-key global-map (kbd "C-c C-r")))
-        (global-queue (lookup-key global-map (kbd "C-c C-l"))))
+        (global-queue (lookup-key global-map (kbd "C-c C-l")))
+        (global-queue-u (lookup-key global-map (kbd "C-c C-u"))))
     (with-temp-buffer
       (emacs-dsh-chat-mode)
       (emacs-dsh--compose)
@@ -28,6 +29,7 @@
         (should (eq (keymap-parent emacs-dsh-chat-mode-map) emacs-dsh-mode-map))
         (dolist (binding '(("C-c C-r" . emacs-dsh-resume)
                            ("C-c C-l" . emacs-dsh-queue)
+                           ("C-c C-u" . emacs-dsh-queue)
                            ("C-c C-c" . emacs-dsh-send)
                            ("C-c C-s" . emacs-dsh-steer)
                            ("C-c C-k" . emacs-dsh-cancel)
@@ -45,7 +47,8 @@
       (should (eq (lookup-key input-map (kbd "C-e"))
                   #'widget-end-of-line)))
     (should (equal (lookup-key global-map (kbd "C-c C-r")) global-resume))
-    (should (equal (lookup-key global-map (kbd "C-c C-l")) global-queue)))))
+    (should (equal (lookup-key global-map (kbd "C-c C-l")) global-queue))
+    (should (equal (lookup-key global-map (kbd "C-c C-u")) global-queue-u)))))
 
 (ert-deftest emacs-dsh-prompt-history-navigation ()
   (with-temp-buffer
@@ -2383,6 +2386,78 @@
           (should (equal (with-temp-buffer (insert-file-contents-literally opened) (buffer-string)) "hello")))
       (emacs-dsh--cleanup-external-images))
     (should-not (file-exists-p opened))))
+
+(ert-deftest emacs-dsh-ui-queue-panel-item-navigation ()
+  (with-temp-buffer
+    (emacs-dsh-queue-mode)
+    (setq emacs-dsh--queue-baseline
+          '((queued . ((id . "a") (content . (((type . "text") (text . "first"))))))
+            (steering . ((id . "b") (content . (((type . "text") (text . "second"))))))))
+    (emacs-dsh--queue-panel-render)
+    (goto-char (point-min))
+    (emacs-dsh-queue-panel-next)
+    (should (equal (get-text-property (point) 'emacs-dsh-queue-id) "a"))
+    (emacs-dsh-queue-panel-next)
+    (should (equal (get-text-property (point) 'emacs-dsh-queue-id) "b"))
+    (emacs-dsh-queue-panel-previous)
+    (should (equal (get-text-property (point) 'emacs-dsh-queue-id) "a"))
+    (should (eq (lookup-key emacs-dsh-queue-mode-map (kbd "n"))
+                #'emacs-dsh-queue-panel-next))
+    (should (eq (lookup-key emacs-dsh-queue-mode-map (kbd "p"))
+                #'emacs-dsh-queue-panel-previous))
+    (should (eq (lookup-key emacs-dsh-queue-mode-map (kbd "M-<up>"))
+                #'emacs-dsh-queue-panel-move-up))
+    (should (eq (lookup-key emacs-dsh-queue-mode-map (kbd "x"))
+                #'emacs-dsh-queue-panel-apply))
+    (should-not (lookup-key emacs-dsh-queue-mode-map (kbd "s")))
+    (should-not (lookup-key emacs-dsh-queue-mode-map (kbd "f")))))
+
+(ert-deftest emacs-dsh-ui-queue-move-up-promotes-follow-up-to-steering ()
+  (let ((owner (generate-new-buffer " *dsh-queue-owner*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer owner (setq-local emacs-dsh--running t))
+          (with-temp-buffer
+            (emacs-dsh-queue-mode)
+            (setq emacs-dsh--queue-owner owner
+                  emacs-dsh--queue-baseline
+                  '((queued . ((id . "follow-1") (content . (((type . "text") (text . "first"))))))
+                    (queued . ((id . "follow-2") (content . (((type . "text") (text . "second"))))))
+                    (steering . ((id . "steer-1") (content . (((type . "text") (text . "current"))))))))
+            (emacs-dsh--queue-panel-render)
+            (goto-char (emacs-dsh--queue-position "follow-2"))
+            (emacs-dsh-queue-panel-move-up)
+            (should (equal (cdr (assoc "follow-2" emacs-dsh--queue-actions))
+                           '((steer . t))))
+            (emacs-dsh--queue-panel-render)
+            (should (< (string-match "Steering (2):" (buffer-string))
+                       (string-match "Follow-up (1):" (buffer-string))))
+            (should (< (string-match "steer-1" (buffer-string))
+                       (string-match "follow-2" (buffer-string))))
+            (should (< (string-match "follow-2" (buffer-string))
+                       (string-match "Follow-up (1):" (buffer-string))))))
+      (kill-buffer owner))))
+
+(ert-deftest emacs-dsh-ui-queue-move-up-allows-empty-steering-group ()
+  (let ((owner (generate-new-buffer " *dsh-queue-owner*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer owner (setq-local emacs-dsh--running t))
+          (with-temp-buffer
+            (emacs-dsh-queue-mode)
+            (setq emacs-dsh--queue-owner owner
+                  emacs-dsh--queue-baseline
+                  '((queued . ((id . "follow-1") (content . (((type . "text") (text . "first"))))))))
+            (emacs-dsh--queue-panel-render)
+            (goto-char (emacs-dsh--queue-position "follow-1"))
+            (emacs-dsh-queue-panel-move-up)
+            (should (equal (cdr (assoc "follow-1" emacs-dsh--queue-actions))
+                           '((steer . t))))
+            (emacs-dsh--queue-panel-render)
+            (should (string-match-p "Steering (1):" (buffer-string)))
+            (should (string-match-p "Follow-up (0):" (buffer-string)))
+            (should (string-match-p "(empty)" (buffer-string)))))
+      (kill-buffer owner))))
 
 (ert-deftest emacs-dsh-ui-queue-panel-edit-apply-does-not-touch-chat-draft ()
   (save-window-excursion

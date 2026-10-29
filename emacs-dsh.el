@@ -884,6 +884,7 @@ receives a string.  Return a silent cancellation function."
     (define-key map (kbd "C-c C-q") #'emacs-dsh-quit)
     (define-key map (kbd "C-c C-r") #'emacs-dsh-resume)
     (define-key map (kbd "C-c C-l") #'emacs-dsh-queue)
+    (define-key map (kbd "C-c C-u") #'emacs-dsh-queue)
     (define-key map (kbd "C-c C-p") #'emacs-dsh-paste)
     (define-key map (kbd "C-c C-i") #'emacs-dsh-focus-input)
     (define-key map (kbd "C-c C-t") #'emacs-dsh-copy-mode)
@@ -3570,12 +3571,12 @@ messages carrying images or files cannot be edited."
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
     (define-key map (kbd "RET") #'emacs-dsh-queue-panel-edit)
+    (define-key map (kbd "n") #'emacs-dsh-queue-panel-next)
+    (define-key map (kbd "p") #'emacs-dsh-queue-panel-previous)
     (define-key map (kbd "d") #'emacs-dsh-queue-panel-remove)
-    (define-key map (kbd "s") #'emacs-dsh-queue-panel-steer)
-    (define-key map (kbd "f") #'emacs-dsh-queue-panel-unsupported)
-    (define-key map (kbd "M-<up>") #'emacs-dsh-queue-panel-unsupported)
+    (define-key map (kbd "M-<up>") #'emacs-dsh-queue-panel-move-up)
     (define-key map (kbd "M-<down>") #'emacs-dsh-queue-panel-unsupported)
-    (define-key map (kbd "C-c C-c") #'emacs-dsh-queue-panel-apply)
+    (define-key map (kbd "x") #'emacs-dsh-queue-panel-apply)
     (define-key map (kbd "C-c C-o") #'emacs-dsh-open-image)
     (define-key map (kbd "g") #'emacs-dsh-queue-panel-refresh)
     (define-key map (kbd "q") #'emacs-dsh-queue-panel-quit)
@@ -3583,7 +3584,7 @@ messages carrying images or files cannot be edited."
   "Bindings for the independent pending-message window.")
 
 (define-derived-mode emacs-dsh-queue-mode special-mode "DSH queue"
-  "Stage pending-message changes; C-c C-c applies them, q discards them."
+  "Stage pending-message changes; x applies them, q discards them."
   (add-hook 'kill-buffer-hook #'emacs-dsh--queue-panel-cleanup nil t))
 
 (defun emacs-dsh--queue-panel-cleanup ()
@@ -3608,32 +3609,43 @@ messages carrying images or files cannot be edited."
     (remove-overlays)
     (erase-buffer)
     (insert (propertize "DSH queue\n" 'face 'bold))
-    (insert "RET edit · d delete · s steer · C-c C-c apply\n")
-    (insert "g refresh/discard · q quit · C-c C-o view image\n")
-    (insert "Text editing only; sorting and follow-up conversion unavailable.\n\n")
-    (when emacs-dsh--queue-actions (insert "Staged changes; apply with C-c C-c.\n\n"))
+    (insert "n/p navigate · RET edit · M-↑ promote follow-up to steer · d delete · x apply\n")
+    (insert "g refresh/discard · q quit · C-c C-o view image · M-↓ unavailable\n")
+    (insert "DSH supports promotion to a running turn, but not sorting or demotion.\n\n")
+    (when emacs-dsh--queue-actions (insert "Staged changes; apply with x.\n\n"))
     (if (null emacs-dsh--queue-baseline) (insert "No pending messages.\n")
-      (dolist (pair emacs-dsh--queue-baseline)
-        (let* ((item (cdr pair)) (item-id (alist-get 'id item))
-               (actions (cdr (assoc item-id emacs-dsh--queue-actions)))
-               (start (point))
-               (placement (if (or (eq (car pair) 'steering) (alist-get 'steer actions))
-                              "Steer" "Follow-up")))
-          (insert (propertize
-                   (format "%s%s  [%s]\n" placement
-                           (if (alist-get 'remove actions) " [deleted]" "")
-                           (emacs-dsh--middle-truncate item-id 18))
-                   'face 'font-lock-keyword-face))
-          (insert (or (alist-get 'edit actions)
-                      (emacs-dsh--content
-                       (cl-remove-if (lambda (block) (equal (alist-get 'type block) "image"))
-                                     (append (alist-get 'content item) nil)))) "\n")
-          (dolist (block (append (alist-get 'content item) nil))
-            (when (equal (alist-get 'type block) "image")
-              (insert (emacs-dsh--image-block block) "\n")))
-          (insert "\n")
-          (put-text-property start (point) 'emacs-dsh-queue-id item-id)
-          (emacs-dsh--load-attachments start (point)))))
+      (dolist (group
+               `(("Steering" . ,(append
+                                  (cl-remove-if-not (lambda (pair) (eq (car pair) 'steering))
+                                                    emacs-dsh--queue-baseline)
+                                  (cl-remove-if-not
+                                   (lambda (pair)
+                                     (and (not (eq (car pair) 'steering))
+                                          (emacs-dsh--queue-panel-steer-p pair)))
+                                   emacs-dsh--queue-baseline)))
+                 ("Follow-up" . ,(cl-remove-if #'emacs-dsh--queue-panel-steer-p
+                                                emacs-dsh--queue-baseline))))
+        (insert (format "%s (%d):\n" (car group) (length (cdr group))))
+        (if (null (cdr group)) (insert "  (empty)\n\n")
+          (dolist (pair (cdr group))
+            (let* ((item (cdr pair)) (item-id (alist-get 'id item))
+                   (actions (cdr (assoc item-id emacs-dsh--queue-actions)))
+                   (start (point)))
+              (insert (propertize
+                       (format "  %s  [%s]\n"
+                               (if (alist-get 'remove actions) "[deleted]" "Message")
+                               (emacs-dsh--middle-truncate item-id 18))
+                       'face 'font-lock-keyword-face))
+              (insert (or (alist-get 'edit actions)
+                          (emacs-dsh--content
+                           (cl-remove-if (lambda (block) (equal (alist-get 'type block) "image"))
+                                         (append (alist-get 'content item) nil)))) "\n")
+              (dolist (block (append (alist-get 'content item) nil))
+                (when (equal (alist-get 'type block) "image")
+                  (insert (emacs-dsh--image-block block) "\n")))
+              (insert "\n")
+              (put-text-property start (point) 'emacs-dsh-queue-id item-id)
+              (emacs-dsh--load-attachments start (point)))))))
     (goto-char (point-min))
     (when id
       (when-let* ((pos (emacs-dsh--queue-position id)))
@@ -3692,19 +3704,51 @@ messages carrying images or files cannot be edited."
     (setf (alist-get kind (cdr cell)) value))
   (emacs-dsh--queue-panel-render))
 
+(defun emacs-dsh--queue-panel-move (step)
+  "Move selection by STEP queue items."
+  (let* ((items emacs-dsh--queue-baseline)
+         (id (get-text-property (point) 'emacs-dsh-queue-id))
+         (index (and id (cl-position id items :key (lambda (pair)
+                                                    (alist-get 'id (cdr pair)))
+                                     :test #'equal)))
+         (target (if index (+ index step)
+                   (if (> step 0) 0 (1- (length items))))))
+    (unless (and items (<= 0 target) (< target (length items)))
+      (user-error "No %s queue message" (if (> step 0) "next" "previous")))
+    (goto-char (or (emacs-dsh--queue-position
+                    (alist-get 'id (cdr (nth target items))))
+                   (point-min)))))
+
+(defun emacs-dsh-queue-panel-next ()
+  "Select the next pending message."
+  (interactive)
+  (emacs-dsh--queue-panel-move 1))
+
+(defun emacs-dsh-queue-panel-previous ()
+  "Select the previous pending message."
+  (interactive)
+  (emacs-dsh--queue-panel-move -1))
+
 (defun emacs-dsh-queue-panel-remove ()
   "Stage deletion of the selected pending message."
   (interactive)
   (emacs-dsh--queue-stage (alist-get 'id (cdr (emacs-dsh--queue-panel-item))) 'remove t))
 
-(defun emacs-dsh-queue-panel-steer ()
-  "Stage promotion of the selected follow-up into the running turn."
+(defun emacs-dsh--queue-panel-steer-p (pair)
+  "Return non-nil when PAIR is or is staged to become steering."
+  (or (eq (car pair) 'steering)
+      (alist-get 'steer
+                 (cdr (assoc (alist-get 'id (cdr pair)) emacs-dsh--queue-actions)))))
+
+(defun emacs-dsh-queue-panel-move-up ()
+  "Promote the selected follow-up into the running turn."
   (interactive)
   (let ((pair (emacs-dsh--queue-panel-item)))
+    (when (emacs-dsh--queue-panel-steer-p pair)
+      (user-error "Already in Steering; DSH does not support queue sorting"))
     (unless (and (buffer-live-p emacs-dsh--queue-owner)
                  (buffer-local-value 'emacs-dsh--running emacs-dsh--queue-owner))
-      (user-error "Steer requires a running turn"))
-    (when (eq (car pair) 'steering) (user-error "Message is already a steer"))
+      (user-error "Moving a follow-up to Steering requires a running turn"))
     (emacs-dsh--queue-stage (alist-get 'id (cdr pair)) 'steer t)))
 
 (defun emacs-dsh-queue-panel-unsupported ()

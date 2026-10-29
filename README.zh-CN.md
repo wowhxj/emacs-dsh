@@ -65,7 +65,7 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 | `RET` 或 `C-c C-c` | 发送输入 |
 | `Shift-Enter` | 在输入框插入换行，不发送 |
 | `C-c C-s` / `C-c C-k` | 运行中 steer / 取消轮次 |
-| `C-c C-l` 或 `/queue` | 打开独立队列窗口，编辑、删除或转为 steer，`C-c C-c` 应用 |
+| `C-c C-l` / `C-c C-u` 或 `/queue` | 打开独立队列窗口；`M-↑` 暂存将 follow-up 移入运行中的 Steering；`x` 应用 |
 | `C-c C-q` | 关闭 Emacs 聊天 buffer，不删除 Host 会话 |
 | `/mode` 或 `M-x emacs-dsh-select-mode` | 为**尚未开始对话**的会话选择模式（Standard、PTC、Minimal、Creator，按 Host 实际可用模式显示） |
 | `M-x emacs-dsh-permission` 或 `/permission <预设>` | 为当前会话选择权限：仅查看、工作区修改、完全权限；Host 提供时还可选 Auto review（值为 `auto`） |
@@ -86,7 +86,7 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 
 客户端会话命令包括 `/name [标题]`（重命名，省略标题则弹出输入）、`/session`（会话信息）、`/copy`（复制最近已加载的助手回复 Markdown）和 `/quit`（关闭聊天）；`/export` 沿用 Host ZIP 导出流程。`/fork [事件序号]` 使用 `session/fork`，默认分叉最后一个已完成回合；`/clone` 使用同一接口复制到最新**已接收**事件，不保证包含 Host 随后新增的事件。两者要求空闲、无待发送图片且无队列写回，保留原聊天并打开新聊天。这些是客户端等价入口，不代表 DSH 暴露了全部 Pi CLI 命令。
 
-`C-c C-l`（或 `/queue`）打开独立队列窗口：在消息上按 `RET` 进入独立文本编辑 buffer，`C-c C-c` 暂存，`C-c C-k` 放弃；列表中 `d` 暂存删除、`s` 暂存转为 steer，最后按 `C-c C-c` 应用。`g` 放弃未应用修改并刷新，`q` 销毁队列和编辑 buffer，不影响聊天草稿。没有本地修改时，列表跟随 Host 的 inbox 投影自动更新；编辑期间队列已变化则拒绝应用，提示刷新。DSH 原生接口只支持编辑纯文本、删除和转为 steer，不支持排序、降回 follow-up 或编辑图片；图片消息可预览和查看，修改时需删除后重新发送。逐项操作可能部分成功，失败时保留剩余修改并明确提示，不自动重试。
+`C-c C-l`、`C-c C-u`（或 `/queue`）打开独立队列窗口：按 `n`/`p` 在消息间导航，按 `RET` 进入独立文本编辑 buffer，`C-c C-c` 暂存编辑，`C-c C-k` 放弃；列表中 `d` 暂存删除，`M-↑` 暂存将 follow-up 移入运行中的 Steering，最后按 `x` 应用。`M-↓` 暂不可用：DSH 不支持队列排序或将 steer 降回 follow-up。`g` 放弃未应用修改并刷新，`q` 销毁队列和编辑 buffer，不影响聊天草稿。没有本地修改时，列表跟随 Host 的 inbox 投影自动更新；编辑期间队列已变化则拒绝应用，提示刷新。DSH 原生接口只支持编辑纯文本、删除和转为 steer，不支持排序、降回 follow-up 或编辑图片；图片消息可预览和查看，修改时需删除后重新发送。逐项操作可能部分成功，失败时保留剩余修改并明确提示，不自动重试。
 
 历史由 Host 保存。`/resume` 的 minibuffer 搜索覆盖 `session/list` 返回的全部可见会话，不逐个请求历史快照；进入会话后初次加载最近 `emacs-dsh-max-messages` 条消息，随后通过 WebSocket 接收实时事件并支持重连。旧**消息**分页尚未实现；Host 在消息内容中提供图片数据时，图形界面会显示图片，文字终端仍显示 `[image]`。
 

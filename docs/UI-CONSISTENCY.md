@@ -28,8 +28,9 @@
 | @ 和 / 用 minibuffer，兼容 Orderless/Vertico | 保留 completing-read；路径类别显式继承当前 completion-styles，不要求安装补全框架 |
 | @ 引用其他 session | 保留 Host 返回的 canonical dsh-session mention 和服务器解析 |
 | ~/sandbox 和多层目录像 C-x C-f 一样深入补全 | @ picker 使用动态 collection 和聊天 root；从完整 minibuffer 输入确定本地目录，保留目录精确候选；RET 插入目录，后续 TAB 浏览子项；session 使用独立入口 |
-| queue 可编辑消息 | 新增独立列表和文本编辑 buffer，暂存后应用；保留原先 minibuffer/composer 编辑入口作为兼容命令 |
-| queue 调整顺序、steer/follow-up 双向转换 | 支持转为 steer；排序和降回 follow-up 无 DSH 原生接口，窗口明确说明，按对应键给可操作错误 |
+| queue 可编辑消息并在条目间导航 | 新增独立列表、n/p 条目导航和文本编辑 buffer，暂存后应用；保留原先 minibuffer/composer 编辑入口作为兼容命令 |
+| queue 跨组提升 | M-↑ 将选中的 follow-up 暂存提升到 Steering，其他条目不移动；DSH 不支持排序或反向转换，M-↓ 给出说明 |
+| 主聊天快捷打开 queue | C-c C-u 与兼容保留的 C-c C-l 均打开独立 queue 窗口 |
 | queue 显示图片、编辑图片 | 支持历史式预览和 C-c C-o；图片编辑不受 DSH 接口支持，明确提示删除后重新发送 |
 | mode-line 显示两类 queue 数量 | 改为与 Pi 一致的 `[S1 F2]`，空队列不显示 |
 | queue 的 q 必须销毁 buffer，不能阻塞后续输入 | q 销毁列表与编辑 buffer；队列编辑不使用聊天 composer，不设置阻塞普通 prompt 的全局编辑状态 |
