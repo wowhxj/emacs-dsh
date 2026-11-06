@@ -3273,3 +3273,40 @@
       (when (buffer-live-p owner) (kill-buffer owner))
       (when (buffer-live-p panel) (kill-buffer panel))
       (when (buffer-live-p editor) (kill-buffer editor)))))
+
+(ert-deftest emacs-dsh-list-items-fill-turn-outline-from-host-cache ()
+  "DSH Desktop 0.2.2 omits turnOutline from session/list; read the Host cache."
+  (let* ((home (make-temp-file "dsh-home" t))
+         (dir (expand-file-name "storages/session_projcache/sessions" home))
+         (emacs-dsh-bridge-file (expand-file-name "emacs-dsh-bridge.json" home)))
+    (unwind-protect
+        (progn
+          (make-directory dir t)
+          (with-temp-file (expand-file-name "s1.json" dir)
+            (insert "{\"version\":7,\"record\":{\"rows\":{\"turnOutline\":"
+                    "{\"ver\":2,\"seq\":9,\"val\":{\"draft\":\"\",\"turns\":"
+                    "[{\"turn\":1,\"seq\":1,\"prompt\":\"first\",\"response\":\"\"},"
+                    "{\"turn\":2,\"seq\":5,\"prompt\":\"latest\",\"response\":\"\"}]}}}}}"))
+          (with-temp-file (expand-file-name "old.json" dir)
+            (insert "{\"record\":{\"rows\":{\"turnOutline\":{\"ver\":1,\"val\":{\"turns\":"
+                    "[{\"prompt\":\"stale\"}]}}}}}"))
+          (with-temp-file (expand-file-name "bad.json" dir) (insert "{not json"))
+          (let* ((live '((sessionId . "live")
+                         (projections (values (turnOutline ((prompt . "host")))))))
+                 (items (list '((sessionId . "s1") (projections (kind . "cached")
+                                                                (values (title . "T"))))
+                              '((sessionId . "s1/../x"))
+                              '((sessionId . "old")) '((sessionId . "bad"))
+                              '((sessionId . "missing")) live))
+                 (original (copy-tree items))
+                 (filled (emacs-dsh--with-cached-outlines items))
+                 (values (alist-get 'values (alist-get 'projections (car filled)))))
+            (should (equal items original))
+            (should (equal (mapcar (lambda (turn) (alist-get 'prompt turn))
+                                   (alist-get 'turnOutline values))
+                           '("first" "latest")))
+            (should (equal (alist-get 'title values) "T"))
+            (should (equal (alist-get 'kind (alist-get 'projections (car filled))) "cached"))
+            (should (equal (cdr filled) (cdr items)))
+            (should (eq (car (last filled)) live))))
+      (delete-directory home t))))

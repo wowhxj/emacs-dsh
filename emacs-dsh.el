@@ -305,6 +305,48 @@ buffer that initiated the call, if that buffer is still alive."
         (expand-file-name "emacs-dsh-bridge.json"
                           (or (getenv "DSH_HOME") (expand-file-name "~/.dsh"))))))
 
+(defun emacs-dsh--cached-turn-outline (session-id)
+  "Return SESSION-ID's turns from the local Host projection cache, or nil.
+DSH Desktop 0.2.2 marks turnOutline summary-excluded, so session/list no
+longer carries it; the Host's own projection cache still does.  Read-only
+and best-effort: a missing, unreadable or incompatible file yields nil.
+The outline may lag the session log until the Host's next checkpoint."
+  ;; ponytail: parses each whole cache file (~6MB for 74 sessions); key a
+  ;; cache on file mtime if listing ever feels slow.
+  (when-let* (((and (stringp session-id)
+                    (string-match-p "\\`[A-Za-z0-9_-]+\\'" session-id)))
+              (bridge (emacs-dsh--bridge-path))
+              (file (expand-file-name
+                     (concat "storages/session_projcache/sessions/" session-id ".json")
+                     (file-name-directory bridge)))
+              ((file-readable-p file)))
+    (ignore-errors
+      (let* ((data (with-temp-buffer
+                     (insert-file-contents file)
+                     (json-parse-buffer :object-type 'alist :array-type 'list
+                                        :null-object nil :false-object nil)))
+             (row (alist-get 'turnOutline (alist-get 'rows (alist-get 'record data)))))
+        ;; Same stateVersion check the Host applies before trusting a row.
+        (when (eql (alist-get 'ver row) 2)
+          (alist-get 'turns (alist-get 'val row)))))))
+
+(defun emacs-dsh--with-cached-outlines (items)
+  "Return session/list ITEMS with cached turnOutline added where omitted.
+Rows that already carry turnOutline (older Hosts) are returned unchanged."
+  (mapcar
+   (lambda (item)
+     (let* ((projections (alist-get 'projections item))
+            (values (alist-get 'values projections))
+            (outline (and (not (assq 'turnOutline values))
+                          (emacs-dsh--cached-turn-outline (alist-get 'sessionId item)))))
+       (if (not outline)
+           item
+         (cons (cons 'projections
+                     (cons (cons 'values (cons (cons 'turnOutline outline) values))
+                           (assq-delete-all 'values (copy-alist projections))))
+               (assq-delete-all 'projections (copy-alist item))))))
+   items))
+
 (defun emacs-dsh--decrypt-dpapi (cipher)
   "Decrypt CIPHER using the current Windows account, without a shell."
   (unless (and (stringp cipher) (string-match-p "\\`[A-Za-z0-9+/]+=*\\'" cipher)
@@ -636,7 +678,8 @@ require validation against the configured Host version."
                 "session/list" `((_request . ,(make-hash-table)))
                 (lambda (value error)
                   (finish
-                   (list :source source :items (alist-get 'items value))
+                   (list :source source
+                         :items (emacs-dsh--with-cached-outlines (alist-get 'items value)))
                    (or error
                        (unless (equal source (emacs-dsh--source-identity))
                          "Host changed during metadata request")))))
@@ -2466,7 +2509,7 @@ CHOOSE-MODE asks for an agent preset only if a new session is selected."
                   (local-cwd (and cwd (emacs-dsh--local-path cwd))))
              ;; Workspace cwds are realpaths without a trailing slash.
              (and local-cwd (file-equal-p local-root local-cwd))))
-         (alist-get 'items value)))
+         (emacs-dsh--with-cached-outlines (alist-get 'items value))))
       (lambda (survivors)
         (emacs-dsh--offer-root-sessions
          (emacs-dsh--session-sort-newest survivors) root choose-mode))))))
@@ -2638,7 +2681,7 @@ suppresses callbacks, not an already sent create request."
    "session/list" `((_request . ,(make-hash-table)))
    (lambda (value)
      (emacs-dsh--archive-empty-sessions
-      (alist-get 'items value)
+      (emacs-dsh--with-cached-outlines (alist-get 'items value))
       (lambda (items)
         (if items
             (emacs-dsh--resume-picker items)
@@ -4005,7 +4048,8 @@ messages carrying images or files cannot be edited."
         (lambda (reply)
           (emacs-dsh--show-reference-choices
            context nil (emacs-dsh--session-reference-details
-                        sessions (alist-get 'items reply))))
+                        sessions (emacs-dsh--with-cached-outlines
+                                  (alist-get 'items reply)))))
         (lambda (failure)
           (message "emacs-dsh: session summaries unavailable: %s" failure)
           (emacs-dsh--show-reference-choices context nil sessions))))
