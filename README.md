@@ -91,7 +91,9 @@ Client session commands include `/name [title]` (rename; omit the title to open 
 
 History is saved by the Host. `/resume` searches all visible sessions from `session/list` without requesting snapshots for each result. Entering a session loads its latest `emacs-dsh-max-messages` messages, then receives live WebSocket events with reconnection support. Pagination of older **messages** is not implemented yet. Images included by the Host appear in graphical Emacs; text terminals show `[image]` instead.
 
-When the Host requests approval or asks a question, the client receives `$events` and handles them in the minibuffer, one at a time. Approvals can be rejected or allowed once; questions support choices, comma-separated multiple choices, free text, and an empty answer to skip. `C-g` cancels the question group. After closing the chat buffer, this client no longer handles that session's requests; another DSH client can still handle them. Agent modes can only be switched before a conversation has started; create a new session to choose another mode later.
+When the Host requests approval or asks a question, the client receives `$events` and handles them in the minibuffer, one at a time. Approvals can be rejected or allowed once; questions support choices, comma-separated multiple choices, free text, and an empty answer to skip. `C-g` cancels the question group. Requests from verified team members can also be handled in an open ancestor chat without opening each member's chat; prompts identify their source. Unrelated or unverified sessions are left to other clients. Reading or listing saved sessions (including through ashub) does not claim their interactions. Routing never widens a child's permissions or overrides Host delegation restrictions. After closing the last eligible chat buffer, another DSH client can still handle those requests. Agent modes can only be switched before a conversation has started; create a new session to choose another mode later.
+
+Chats follow the Host's current working directory, including worktree switches, for subsequent file completion and references. This does not move files, change Workspace membership, or change the original directory used to verify session restoration. An inaccessible local mapping is reported rather than silently completing files from the previous directory. If a draft contains `@` when the directory changes, sending requires explicit confirmation that its references have been checked against the new directory; declining keeps the draft. Removing all `@` references also clears this warning. Buffer names do not automatically change with the directory.
 
 ## Troubleshooting
 
@@ -113,6 +115,14 @@ emacs -Q --batch -L /path/to/websocket-el -L /path/to/markdown-mode -L . -l emac
 ```
 
 Emacs regression tests can run on Windows/WSL; unit tests cover macOS clipboard and path logic, while queue and reference logic does not depend on WSL path utilities. Actual end-to-end behavior with the Desktop Host should still be checked on macOS. The Host bridge has its own test and release process.
+
+With a local ashub checkout, also run the optional cross-project tests (add the same dependency paths as above):
+
+```sh
+emacs -Q --batch -L . -L /path/to/ashub -l ./emacs-dsh.el -l ./ashub-compat-tests.el -f ert-run-tests-batch-and-exit
+```
+
+These use simulated Host frames, not a live Desktop. They check restoration when the current worktree differs from the original directory and the ashub reference-provider contract.
 
 Protocol references: [Session Controller](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/api/session-controller), [Connection](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/client/connection), and [API Gateway](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/api/gateway).
 

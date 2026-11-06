@@ -90,7 +90,9 @@ Windows Desktop + WSL Emacs 时，新会话目录必须能被 Windows Host 访�
 
 历史由 Host 保存。`/resume` 的 minibuffer 搜索覆盖 `session/list` 返回的全部可见会话，不逐个请求历史快照；进入会话后初次加载最近 `emacs-dsh-max-messages` 条消息，随后通过 WebSocket 接收实时事件并支持重连。旧**消息**分页尚未实现；Host 在消息内容中提供图片数据时，图形界面会显示图片，文字终端仍显示 `[image]`。
 
-Host 请求审批或提问时，客户端通过 `$events` 接收并在 minibuffer 中逐个处理：审批可“拒绝/仅本次允许”，问答支持选项、逗号分隔多选、自由文本和空输入跳过；`C-g` 取消问题组。关闭聊天 buffer 后该客户端不再接管该会话的请求，仍可由其他 DSH 客户端处理。切换模式只适用于空白会话；已开始对话的会话需要先新建会话再选择模式。
+Host 请求审批或提问时，客户端通过 `$events` 接收并在 minibuffer 中逐个处理：审批可“拒绝/仅本次允许”，问答支持选项、逗号分隔多选、自由文本和空输入跳过；`C-g` 取消问题组。经 Host 确认归属的团队成员请求，也可在已经打开的祖先聊天中处理，无需逐个打开成员聊天；提问时会标明来源。无关或归属不明的会话交给其他客户端处理。仅枚举或读取历史（包括通过 ashub）不会接管交互；路由不会扩大子智能体权限，也不会绕过 Host 的委派限制。关闭最后一个符合条件的聊天 buffer 后，仍可由其他 DSH 客户端处理这些请求。切换模式只适用于空白会话；已开始对话的会话需要先新建会话再选择模式。
+
+聊天会跟随 Host 当前工作目录（包括工作树切换），供后续文件补全和引用使用；不会移动文件、改变 Workspace 归属或改写恢复会话时校验的初始目录。本地映射路径不可访问时会明确提示，不会悄悄继续补全旧目录的文件。目录切换时草稿若含 `@`，发送前必须明确确认已按新目录检查引用；拒绝确认会保留草稿，移除所有 `@` 引用也会清除此提醒。聊天 buffer 名不会随目录自动更名。
 
 ## 故障排查
 
@@ -112,6 +114,14 @@ emacs -Q --batch -L /path/to/websocket-el -L /path/to/markdown-mode -L . -l emac
 ```
 
 Windows/WSL 的 Emacs 回归测试可运行；macOS 的剪贴板与路径有单元测试，队列和引用逻辑不依赖 WSL 路径工具。真实 Desktop Host 端到端行为仍需在 Mac 上验证。Host bridge 有自己的测试和发布流程。
+
+有本地 ashub 源码时，还可运行跨项目兼容测试（与上面的命令一样添加依赖目录）：
+
+```sh
+emacs -Q --batch -L . -L /path/to/ashub -l ./emacs-dsh.el -l ./ashub-compat-tests.el -f ert-run-tests-batch-and-exit
+```
+
+这些测试模拟 Host 消息，不连接真实 Desktop；检查当前工作树与初始目录不同时的恢复，以及 ashub 引用 provider 的契约。
 
 协议参考：[Session Controller](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/api/session-controller)、[Connection](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/client/connection)、[API Gateway](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/api/gateway)。
 

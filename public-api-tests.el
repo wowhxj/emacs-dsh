@@ -241,5 +241,85 @@
     (emacs-dsh-insert-file "/tmp/x.md")
     (should (equal (emacs-dsh--draft-text) "see @x.md"))))
 
+(ert-deftest emacs-dsh-api-open-verifies-original-directory-and-follows-worktree ()
+  "Restore verifies the snapshot header cwd, then follows the current one."
+  (let* ((emacs-dsh--chats (make-hash-table :test #'equal))
+         (root (file-truename (make-temp-file "dsh-api-root-" t)))
+         (worktree (file-truename (make-temp-file "dsh-api-worktree-" t)))
+         (buffer (generate-new-buffer " *dsh-api-cwd-test*"))
+         ready failure)
+    (unwind-protect
+        (cl-letf (((symbol-function 'emacs-dsh--ensure-auth) (lambda (cb) (funcall cb nil)))
+                  ((symbol-function 'websocket-openp) (lambda (_) t))
+                  ((symbol-function 'emacs-dsh--call)
+                   (lambda (&rest _) (ert-fail "Restore issued a management write")))
+                  ((symbol-function 'emacs-dsh--show)
+                   (lambda (id directory display)
+                     (should (eq display 'none))
+                     (with-current-buffer buffer
+                       (emacs-dsh-chat-mode)
+                       (setq-local emacs-dsh--session-id id
+                                   emacs-dsh--socket 'fake
+                                   emacs-dsh--root directory
+                                   default-directory directory)
+                       (emacs-dsh--compose)
+                       (emacs-dsh--on-frame
+                        buffer 'fake
+                        (make-websocket-frame
+                         :payload
+                         (json-serialize
+                          `((type . "item") (streamId . ,id)
+                            (value
+                             . ((type . "snapshot")
+                                (header . ((sessionId . ,id) (cwd . ,root)))
+                                (cursor . 10) (records . [])
+                                (projections
+                                 . ((asOfSeq . 10)
+                                    (values . ((workingDirectory . ,worktree))))))))))))
+                     buffer)))
+          (emacs-dsh-open-session "s" :directory root :display 'none
+                                  :on-ready (lambda (b) (setq ready b))
+                                  :on-error (lambda (e) (setq failure e)))
+          (let ((deadline (+ (float-time) 1)))
+            (while (and (not ready) (not failure) (< (float-time) deadline))
+              (accept-process-output nil 0.02)))
+          (should-not failure)
+          (should (eq ready buffer))
+          (with-current-buffer buffer
+            (should (equal emacs-dsh--verified-session (list "s" root)))
+            (should (file-equal-p emacs-dsh--root worktree))
+            (should (file-equal-p default-directory worktree))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (setq emacs-dsh--socket nil))
+        (kill-buffer buffer))
+      (delete-directory root)
+      (delete-directory worktree))))
+
+(ert-deftest emacs-dsh-api-read-does-not-claim-interactions-or-directory ()
+  "Reading a saved session must not route its team or open an interaction."
+  (let ((emacs-dsh--relations (make-hash-table :test #'equal))
+        (emacs-dsh--relation-seqs (make-hash-table :test #'equal))
+        (emacs-dsh--relations-source nil)
+        (emacs-dsh--events-socket nil))
+    (cl-letf (((symbol-function 'emacs-dsh--events-connect)
+               (lambda (&rest _) (ert-fail "Session read subscribed to interactions"))))
+      (pcase-let ((`(,result ,failure ,_sent ,_closed)
+                   (emacs-dsh-api-test-read
+                    (json-serialize
+                     '((type . "snapshot")
+                       (header . ((sessionId . "s") (cwd . "/work")))
+                       (cursor . 3) (records . [])
+                       (projections
+                        . ((asOfSeq . 3)
+                           (values
+                            . ((workingDirectory . "/current-worktree")
+                               (agentTeam
+                                . ((members . [((id . "child") (name . "reviewer")
+                                                (role . "teammate"))]))))))))))))
+        (should-not failure)
+        (should (equal (plist-get result :cwd) "/work"))
+        (should (= (hash-table-count emacs-dsh--relations) 0))
+        (should-not emacs-dsh--events-socket)))))
+
 (provide 'public-api-tests)
 ;;; public-api-tests.el ends here

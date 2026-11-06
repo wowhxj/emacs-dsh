@@ -124,6 +124,14 @@ The fallback is used only when the Host does not offer auto."
   (list emacs-dsh--authenticated-base emacs-dsh--authenticated-nonce
         emacs-dsh--authenticated-mode))
 (defvar-local emacs-dsh--root nil)
+(defvar-local emacs-dsh--host-cwd nil)
+(defvar-local emacs-dsh--cwd-seq -1)
+(defvar-local emacs-dsh--cwd-stale-draft nil)
+(defvar emacs-dsh--relations (make-hash-table :test #'equal))
+(defvar emacs-dsh--relation-seqs (make-hash-table :test #'equal))
+(defvar emacs-dsh--events-source nil)
+(defvar emacs-dsh--relations-source nil)
+(defvar emacs-dsh--question-source nil)
 (defvar-local emacs-dsh--socket nil)
 (defvar-local emacs-dsh--cursor -1)
 (defvar-local emacs-dsh--seen nil)
@@ -912,6 +920,40 @@ receives a string.  Return a silent cancellation function."
             (string-trim (buffer-string))
           path))
     path))
+
+(defun emacs-dsh--snapshot-cwd (snapshot)
+  "Return current Host cwd in SNAPSHOT; only an absent key uses the header."
+  (let ((cell (assq 'workingDirectory
+                    (alist-get 'values (alist-get 'projections snapshot)))))
+    (if cell (cdr cell) (alist-get 'cwd (alist-get 'header snapshot)))))
+
+(defun emacs-dsh--set-cwd (cwd seq)
+  "Apply Host CWD at SEQ without reinterpreting an existing reference draft."
+  (when (and (numberp seq) (>= seq emacs-dsh--cwd-seq))
+    (unless (equal cwd emacs-dsh--host-cwd)
+      (when (and emacs-dsh--input-start
+                 (string-match-p "@" (emacs-dsh--draft-text)))
+        (setq emacs-dsh--cwd-stale-draft (emacs-dsh--draft-text)))
+      (setq emacs-dsh--host-cwd cwd)
+      (let ((local (and (stringp cwd) (not (string-empty-p cwd))
+                        (emacs-dsh--local-path cwd))))
+        ;; A Host path must never be expanded relative to Emacs's old cwd.
+        (setq emacs-dsh--root
+              (and local (file-name-absolute-p local) (not (file-remote-p local))
+                   (file-directory-p local) (file-readable-p local)
+                   (file-name-as-directory local)))
+        (when emacs-dsh--root (setq default-directory emacs-dsh--root))))
+    (setq emacs-dsh--cwd-seq seq)))
+
+(defun emacs-dsh--check-draft-cwd ()
+  "Require explicit confirmation of references retained across a cwd change."
+  (when emacs-dsh--cwd-stale-draft
+    (if (not (string-match-p "@" (emacs-dsh--draft-text)))
+        (setq emacs-dsh--cwd-stale-draft nil)
+      (unless (yes-or-no-p
+               "DSH directory changed. Have you checked every @ reference against the new directory? ")
+        (user-error "Draft kept; correct or remove @ references before sending"))
+      (setq emacs-dsh--cwd-stale-draft nil))))
 
 (defun emacs-dsh--project-root ()
   (let ((project (project-current nil)))
@@ -1906,6 +1948,8 @@ code indentation and the raw answer used by /copy unchanged."
          (setq emacs-dsh--model-selection data))
         ("agent-preset/selected"
          (setq emacs-dsh--agent-preset (alist-get 'agentPreset data)))
+        ("working-directory/change"
+         (emacs-dsh--set-cwd (alist-get 'cwd data) seq))
         ("session/title" (setq emacs-dsh--title (alist-get 'title data)))
         ("request/header"
          (let* ((header (alist-get 'header data))
@@ -1950,6 +1994,8 @@ code indentation and the raw answer used by /copy unchanged."
                           (format ": %s" (or (alist-get 'message failure) failure)) ""))
               (if failure 'error 'shadow)))
            (emacs-dsh--insert-before-input "")))))
+    (when (or emacs-dsh--events-active emacs-dsh--events-queue)
+      (emacs-dsh--refresh-interaction-waiting))
     (when emacs-dsh--live-process
       (emacs-dsh--process-regions emacs-dsh--live-process
                                   (or emacs-dsh--input-start (point-max))))
@@ -2005,40 +2051,60 @@ code indentation and the raw answer used by /copy unchanged."
 
     (emacs-dsh--queue-panel-sync)
     (force-mode-line-update)))
+
+(defun emacs-dsh--team-relations (parent team seq)
+  "Replace PARENT's authoritative TEAM membership at SEQ."
+  (let ((source (emacs-dsh--source-identity)))
+    (unless (equal source emacs-dsh--relations-source)
+      (clrhash emacs-dsh--relations)
+      (clrhash emacs-dsh--relation-seqs)
+      (setq emacs-dsh--relations-source source))
+    (when (>= seq (gethash parent emacs-dsh--relation-seqs -1))
+      (let (remove)
+        (maphash (lambda (child value)
+                   (when (equal parent (car value)) (push child remove)))
+                 emacs-dsh--relations)
+        (dolist (child remove) (remhash child emacs-dsh--relations)))
+      (dolist (member (append (alist-get 'members team) nil))
+        (let ((id (alist-get 'id member)))
+          (when (and (stringp id) (not (equal id parent))
+                     (equal (alist-get 'role member) "teammate"))
+            (puthash id (list parent (alist-get 'name member)) emacs-dsh--relations))))
+      (puthash parent seq emacs-dsh--relation-seqs))))
+
+(defun emacs-dsh--apply-projections (id values seq)
+  "Apply Session ID's replacement VALUES at SEQ."
+  (when (and (stringp id) (assq 'agentTeam values))
+    (emacs-dsh--team-relations id (alist-get 'agentTeam values) seq))
+  (when (equal id emacs-dsh--session-id)
+    (when (assq 'workingDirectory values)
+      (emacs-dsh--set-cwd (alist-get 'workingDirectory values) seq))
+    (when (assq 'inbox values)
+      (emacs-dsh--set-inbox (alist-get 'inbox values) seq))
+    (when (assq 'contextPressure values)
+      (setq emacs-dsh--context-pressure (alist-get 'contextPressure values)))
+    (when (assq 'agentPreset values)
+      (setq emacs-dsh--agent-preset (alist-get 'agentPreset values)))
+    (when-let* ((permission (alist-get 'currentValue (alist-get 'permissions values))))
+      (setq emacs-dsh--permission permission))
+    (force-mode-line-update)))
+
 (defun emacs-dsh--control-item (value)
-  "Handle a session/control baseline or projection VALUE."
+  "Handle current replacement frames and legacy single-key VALUE frames."
   (pcase (alist-get 'type value)
     ("baseline"
-     (let* ((projections (alist-get 'projections (alist-get 'value value)))
-            (entry (cl-loop for (id . cell) in projections
-                            when (equal (if (symbolp id) (symbol-name id) id)
-                                        emacs-dsh--session-id)
-                            return cell))
-            (values (alist-get 'values entry)))
-       (emacs-dsh--set-inbox (alist-get 'inbox values)
-                             (or (alist-get 'asOfSeq entry) -1))
-       (setq emacs-dsh--context-pressure (alist-get 'contextPressure values)
-             emacs-dsh--agent-preset (alist-get 'agentPreset values))
-       (when-let* ((permission (alist-get 'currentValue
-                                         (alist-get 'permissions values))))
-         (setq emacs-dsh--permission permission))
-       (force-mode-line-update)))
+     (dolist (entry (alist-get 'projections (alist-get 'value value)))
+       (emacs-dsh--apply-projections
+        (if (symbolp (car entry)) (symbol-name (car entry)) (car entry))
+        (alist-get 'values (cdr entry)) (or (alist-get 'asOfSeq (cdr entry)) -1))))
     ("projection"
-     (when (equal (alist-get 'sessionId value) emacs-dsh--session-id)
-       (pcase (alist-get 'key value)
-         ("inbox" (emacs-dsh--set-inbox (alist-get 'value value)
-                                         (alist-get 'seq value)))
-         ("contextPressure"
-          (setq emacs-dsh--context-pressure (alist-get 'value value))
-          (force-mode-line-update))
-         ("permissions"
-          (when-let* ((permission (alist-get 'currentValue
-                                            (alist-get 'value value))))
-            (setq emacs-dsh--permission permission)
-            (force-mode-line-update)))
-         ("agentPreset"
-          (setq emacs-dsh--agent-preset (alist-get 'value value))
-          (force-mode-line-update)))))))
+     (let ((key (alist-get 'key value)))
+       (emacs-dsh--apply-projections
+        (alist-get 'sessionId value)
+        (cond ((assq 'changes value) (alist-get 'changes value))
+              ((stringp key)
+               (list (cons (intern key) (alist-get 'value value)))))
+        (or (alist-get 'seq value) -1))))))
 
 (defun emacs-dsh--control-payload ()
   "Return a session/control subscription frame."
@@ -2064,19 +2130,27 @@ code indentation and the raw answer used by /copy unchanged."
                    (let ((value (alist-get 'value data)))
                      (pcase (alist-get 'type value)
                        ("snapshot"
-                         (setq emacs-dsh--verified-session
-                               (let ((header (alist-get 'header value)))
-                                 (list (or (alist-get 'sessionId header)
-                                           (alist-get 'id header))
-                                       (alist-get 'cwd header))))
+                        (setq emacs-dsh--verified-session
+                              (let ((header (alist-get 'header value)))
+                                (list (or (alist-get 'sessionId header)
+                                          (alist-get 'id header))
+                                      (alist-get 'cwd header))))
                         (when-let* ((created (alist-get 'createdAt
                                                        (alist-get 'header value))))
                           (puthash emacs-dsh--session-id created emacs-dsh--created-at))
                         (when (< emacs-dsh--cursor 0)
                           (clrhash emacs-dsh--seen))
+                        (emacs-dsh--set-cwd
+                          (emacs-dsh--snapshot-cwd value)
+                          (or (alist-get 'asOfSeq (alist-get 'projections value))
+                              (alist-get 'cursor value) -1))
                         (dolist (record (alist-get 'records value))
                           (emacs-dsh--event (alist-get 'event record)))
                         (let ((values (alist-get 'values (alist-get 'projections value))))
+                          (when (assq 'agentTeam values)
+                            (emacs-dsh--team-relations
+                             emacs-dsh--session-id (alist-get 'agentTeam values)
+                             (or (alist-get 'asOfSeq (alist-get 'projections value)) -1)))
                           (when-let* ((selection (alist-get 'next
                                                              (alist-get 'modelSelection values))))
                             (setq emacs-dsh--model-selection selection))
@@ -2106,11 +2180,56 @@ code indentation and the raw answer used by /copy unchanged."
                     (endpoint . ,endpoint)
                     (payload . ((args . ,(make-hash-table)))))))
 
+(defun emacs-dsh--interaction-chat (entry)
+  "Find ENTRY's source chat or nearest verified Team ancestor."
+  (let ((id (nth 2 entry)) seen chat
+        (source (emacs-dsh--source-identity)))
+    (when (equal source (nth 5 entry))
+      (while (and id (not chat) (not (member id seen)))
+        (push id seen)
+        (let ((candidate (gethash id emacs-dsh--chats)))
+          (when (and (buffer-live-p candidate)
+                     (equal source (buffer-local-value 'emacs-dsh--source candidate)))
+            (setq chat candidate)))
+        (setq id (and (equal source emacs-dsh--relations-source)
+                      (car (gethash id emacs-dsh--relations)))))
+      chat)))
+
+(defun emacs-dsh--interaction-label (entry)
+  "Return ENTRY's source label, retaining its original Agent identity."
+  (or (and (equal (nth 5 entry) emacs-dsh--relations-source)
+           (cadr (gethash (nth 2 entry) emacs-dsh--relations)))
+      (nth 2 entry)))
+
+(defun emacs-dsh--refresh-interaction-waiting ()
+  "Count pending requests separately for every eligible open chat."
+  (maphash
+   (lambda (_id chat)
+     (when (buffer-live-p chat)
+       ;; The oldest pending request names the kind the minibuffer asks next.
+       (let ((entries (cl-remove-if-not
+                       (lambda (entry)
+                         (and (not (member (nth 1 entry) emacs-dsh--events-cancelled))
+                              (eq chat (emacs-dsh--interaction-chat entry))))
+                       (append (and emacs-dsh--events-active
+                                    (list emacs-dsh--events-active))
+                               emacs-dsh--events-queue))))
+         (with-current-buffer chat
+           (setq emacs-dsh--waiting
+                 (when entries
+                   (format "%s (%d)"
+                           (if (equal (nth 3 (car entries)) "approval/request")
+                               "approval needed" "answer needed")
+                           (length entries))))
+           (force-mode-line-update)))))
+   emacs-dsh--chats))
+
 (defun emacs-dsh--events-result (entry outcome)
   "Reply to waterfall ENTRY using OUTCOME on its original generation."
-  (when (and (equal (nth 0 entry) emacs-dsh--events-client)
+  (when (and (equal (nth 5 entry) (emacs-dsh--source-identity))
+             (equal (nth 0 entry) emacs-dsh--events-client)
              (not (member (nth 1 entry) emacs-dsh--events-cancelled)))
-    (let ((chat (gethash (nth 2 entry) emacs-dsh--chats)))
+    (let ((chat (emacs-dsh--interaction-chat entry)))
       (with-current-buffer (if (buffer-live-p chat) chat (current-buffer))
         (emacs-dsh--call
          "$events/result"
@@ -2125,7 +2244,8 @@ code indentation and the raw answer used by /copy unchanged."
          (options (alist-get 'options question))
          (labels (mapcar (lambda (option) (alist-get 'label option)) options))
          (multi (alist-get 'multiSelect question))
-         (prompt (format "%s%s%s: " (or (alist-get 'question question) "Question")
+         (prompt (format "%s%s%s%s: " (or emacs-dsh--question-source "")
+                         (or (alist-get 'question question) "Question")
                          (if-let* ((detail (alist-get 'detail question)))
                              (format " — %s" detail) "")
                          (if multi " (comma-separated; empty skips)" " (empty skips)")))
@@ -2150,12 +2270,14 @@ code indentation and the raw answer used by /copy unchanged."
 (defun emacs-dsh--events-answer (entry)
   "Prompt for one queued ENTRY, then reply to its host waterfall."
   (let ((event (nth 3 entry)) (request (nth 4 entry))
-        (emacs-dsh--events-prompting entry))
+        (emacs-dsh--events-prompting entry)
+        (emacs-dsh--question-source
+         (format "[%s] " (emacs-dsh--interaction-label entry))))
     (condition-case err
         (pcase event
           ("approval/request"
            (let ((choice (completing-read
-                          (format "Allow %s%s? "
+                          (format "%sAllow %s%s? " emacs-dsh--question-source
                                   (or (alist-get 'toolName request) "tool")
                                   (if-let* ((reason (alist-get 'reason request)))
                                       (format " (%s)" reason) ""))
@@ -2179,11 +2301,7 @@ code indentation and the raw answer used by /copy unchanged."
       (error
        (message "emacs-dsh: interaction failed: %s" (error-message-string err))
        (emacs-dsh--events-result entry '((kind . "next")))))
-  (when-let* ((chat (gethash (nth 2 entry) emacs-dsh--chats))
-              ((buffer-live-p chat)))
-    (with-current-buffer chat
-      (setq emacs-dsh--waiting nil)
-      (force-mode-line-update)))))
+    (emacs-dsh--refresh-interaction-waiting)))
 
 (defun emacs-dsh--events-drain ()
   "Serialize host questions and approvals in Emacs' single minibuffer."
@@ -2196,10 +2314,11 @@ code indentation and the raw answer used by /copy unchanged."
           (unless (member (nth 1 entry) emacs-dsh--events-cancelled)
             (setq emacs-dsh--events-active entry)
             (unwind-protect
-                (if (buffer-live-p (gethash (nth 2 entry) emacs-dsh--chats))
+                (if (emacs-dsh--interaction-chat entry)
                     (emacs-dsh--events-answer entry)
                   (emacs-dsh--events-result entry '((kind . "next"))))
-              (setq emacs-dsh--events-active nil))))))))
+              (setq emacs-dsh--events-active nil)
+              (emacs-dsh--refresh-interaction-waiting))))))))
 
 (defun emacs-dsh--events-frame (socket frame)
   "Handle a host-wide $events FRAME from SOCKET."
@@ -2212,22 +2331,15 @@ code indentation and the raw answer used by /copy unchanged."
           (when (equal (alist-get 'type message) "item")
             (pcase (alist-get 'type value)
               ("ready" (setq emacs-dsh--events-client (alist-get 'clientId value)
-                              emacs-dsh--events-queue nil
-                              emacs-dsh--events-cancelled nil))
+                             emacs-dsh--events-queue nil
+                             emacs-dsh--events-cancelled nil)
+               (emacs-dsh--refresh-interaction-waiting))
               ("cancel"
                (push event-id emacs-dsh--events-cancelled)
-               (let* ((entry (or (and (equal event-id (nth 1 emacs-dsh--events-active))
-                                      emacs-dsh--events-active)
-                                 (cl-find event-id emacs-dsh--events-queue
-                                          :key #'cadr :test #'equal)))
-                      (chat (and entry (gethash (nth 2 entry) emacs-dsh--chats))))
-                 (when (buffer-live-p chat)
-                   (with-current-buffer chat
-                     (setq emacs-dsh--waiting nil)
-                     (force-mode-line-update))))
                (setq emacs-dsh--events-queue
                      (cl-remove-if (lambda (entry) (equal event-id (nth 1 entry)))
                                    emacs-dsh--events-queue))
+               (emacs-dsh--refresh-interaction-waiting)
                (when (and (equal event-id (nth 1 emacs-dsh--events-prompting))
                           (active-minibuffer-window))
                  (abort-recursive-edit)))
@@ -2238,19 +2350,15 @@ code indentation and the raw answer used by /copy unchanged."
                  (let ((entry (list emacs-dsh--events-client event-id
                                     (alist-get 'agentId value)
                                     (alist-get 'event value)
-                                    (alist-get 'request value))))
+                                    (alist-get 'request value)
+                                    (or emacs-dsh--events-source
+                                        (emacs-dsh--source-identity)))))
                    (unless (or (equal event-id (nth 1 emacs-dsh--events-active))
                                (cl-find event-id emacs-dsh--events-queue
                                         :key #'cadr :test #'equal))
                      (setq emacs-dsh--events-queue
                            (nconc emacs-dsh--events-queue (list entry)))
-                     (when-let* ((chat (gethash (nth 2 entry) emacs-dsh--chats))
-                                 ((buffer-live-p chat)))
-                       (with-current-buffer chat
-                         (setq emacs-dsh--waiting
-                               (if (equal (nth 3 entry) "approval/request")
-                                   "approval needed" "answer needed"))
-                         (force-mode-line-update)))
+                     (emacs-dsh--refresh-interaction-waiting)
                      (run-at-time 0 nil #'emacs-dsh--events-drain))))))))
       (error (message "emacs-dsh: host interaction frame: %s"
                       (error-message-string err))))))
@@ -2261,6 +2369,7 @@ code indentation and the raw answer used by /copy unchanged."
     (when emacs-dsh--events-retry
       (cancel-timer emacs-dsh--events-retry)
       (setq emacs-dsh--events-retry nil))
+    (setq emacs-dsh--events-source (emacs-dsh--source-identity))
     (let* ((base (emacs-dsh--base))
            (socket-url (concat (if (string-prefix-p "https:" base) "wss" "ws")
                                (substring base (if (string-prefix-p "https:" base) 5 4))
@@ -2341,7 +2450,10 @@ MAX-MESSAGES limits history included in the first snapshot."
      (let ((old emacs-dsh--socket))
       (setq emacs-dsh--socket nil)
        (when old (websocket-close old)))
-     (setq emacs-dsh--queue-seq -1 emacs-dsh--queue-ready nil)
+     ;; The next snapshot re-baselines queue and directory at its own seq;
+     ;; keeping an old high-water mark would silently retain a stale cwd.
+     (setq emacs-dsh--queue-seq -1 emacs-dsh--queue-ready nil
+           emacs-dsh--cwd-seq -1)
     (let* ((buffer (current-buffer))
            (base (emacs-dsh--base))
            (scheme (if (string-prefix-p "https:" base) "wss" "ws"))
@@ -3464,6 +3576,8 @@ the identifying beginning and end of IDs and paths."
   ;; field's end; route here so RET and C-c C-c always save the edit.
   (if emacs-dsh--queue-edit
       (emacs-dsh-queue-edit-save)
+    ;; Saving a queue edit must not consume the composer draft's confirmation.
+    (emacs-dsh--check-draft-cwd)
     (let ((draft (emacs-dsh--draft-text)))
       (if (string-prefix-p "/" draft)
           (emacs-dsh--submit-slash mode draft)
@@ -4015,7 +4129,10 @@ messages carrying images or files cannot be edited."
 
 (defun emacs-dsh--complete-host-file (context)
   "Complete @ using file candidates only."
-  (let ((query (plist-get context :query)))
+  (unless emacs-dsh--root
+    (user-error "Host directory is not accessible locally: %s" emacs-dsh--host-cwd))
+  (let ((query (plist-get context :query))
+        (cwd emacs-dsh--host-cwd))
     ;; Bare @ means this chat's directory, not the Host's fuzzy index.
     ;; Even an empty local directory is authoritative, not a reason to
     ;; silently show another workspace's files.
@@ -4028,12 +4145,15 @@ messages carrying images or files cannot be edited."
        "fileReferences/list"
        `((agentId . ,emacs-dsh--session-id) (query . ,query))
        (lambda (files)
-         (emacs-dsh--show-reference-choices
-          context (or files (emacs-dsh--local-file-candidates query)) nil))
+         ;; A pending reply must not complete against a newer Host directory.
+         (when (equal cwd emacs-dsh--host-cwd)
+           (emacs-dsh--show-reference-choices
+            context (or files (emacs-dsh--local-file-candidates query)) nil)))
        (lambda (failure)
-         (message "emacs-dsh: file candidates unavailable: %s" failure)
-         (emacs-dsh--show-reference-choices
-          context (emacs-dsh--local-file-candidates query) nil))))))
+         (when (equal cwd emacs-dsh--host-cwd)
+           (message "emacs-dsh: file candidates unavailable: %s" failure)
+           (emacs-dsh--show-reference-choices
+            context (emacs-dsh--local-file-candidates query) nil)))))))
 
 (defun emacs-dsh--complete-session-reference (context)
   "Complete @session through the Host's session-reference resolver."

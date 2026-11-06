@@ -54,6 +54,20 @@ interactive commands retain their full-window default. Buffer reuse is
 rejected across different authenticated Host generations. This is not a
 multi-Host connection manager.
 
+The directory used to verify restoration remains the snapshot header's cwd;
+it is not replaced by the Session's current `workingDirectory` projection.
+After restoration, the chat follows Host working-directory changes (including
+worktree switches) without changing the Session ID or moving its Workspace.
+Callers such as ashub must not interpret the chat's local `default-directory`
+as a replacement for the directory identity returned by session enumeration.
+
+Only an open chat can host interactive requests from its verified Team descendants.
+Membership comes from the Host's `agentTeam` projection; ordinary subagents
+without an authoritative Team relationship are not inferred from tool text.
+Enumerating or reading a Session does not open a chat or claim its questions
+and approvals. Routing a descendant's request does not change its originating
+Agent, permissions, or the Host's delegation policy.
+
 ## Reading a saved dialogue
 
 ```elisp
