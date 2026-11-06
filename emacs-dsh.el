@@ -915,7 +915,7 @@ receives a string.  Return a silent cancellation function."
 (defvar emacs-dsh-copy-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-j") #'emacs-dsh-semi-char-mode)
-    (define-key map (kbd "i") #'emacs-dsh-semi-char-mode)
+    (define-key map (kbd "i") #'emacs-dsh-copy-mode-return-to-input)
     (define-key map (kbd "C-a") #'move-beginning-of-line)
     (define-key map (kbd "M-p") #'backward-paragraph)
     (define-key map (kbd "M-n") #'forward-paragraph)
@@ -951,6 +951,11 @@ receives a string.  Return a silent cancellation function."
         minor-mode-overriding-map-alist)
   (force-mode-line-update t)
   (message "DSH copy mode; C-c C-j returns to input"))
+
+(defun emacs-dsh-copy-mode-return-to-input ()
+  "Return to the DSH composer when `i' is pressed in copy mode."
+  (interactive)
+  (emacs-dsh-semi-char-mode))
 
 (defun emacs-dsh-semi-char-mode ()
   "Return to the DSH composer."
