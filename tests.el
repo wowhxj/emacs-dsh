@@ -117,6 +117,20 @@
     (goto-char (point-min))
     (should-error (insert "overwrite"))))
 
+(ert-deftest emacs-dsh-i-focuses-composer-from-history-without-copy-mode ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (emacs-dsh--insert-before-input "History")
+    (emacs-dsh--compose)
+    (emacs-dsh--replace-draft "draft")
+    (goto-char (point-min))
+    (should-not emacs-dsh--copy-mode)
+    (should (eq (key-binding (kbd "i")) #'emacs-dsh-copy-mode-return-to-input))
+    (call-interactively (key-binding (kbd "i")))
+    (should (= (point) (+ (emacs-dsh--draft-beginning) 5)))
+    (should (eq (key-binding (kbd "i")) #'self-insert-command))
+    (should (equal (emacs-dsh--draft-text) "draft"))))
+
 (ert-deftest emacs-dsh-i-focuses-composer-without-changing-draft ()
   (with-temp-buffer
     (emacs-dsh-chat-mode)
@@ -1792,10 +1806,48 @@
                                 ((type . "image")
                                  (attachment . ((attachmentId . "sha256:abc")
                                                 (mediaType . "image/png")))))))))))
-      (should (equal requested '((sessionId . "s1") (attachmentId . "sha256:abc"))))
+      (should (equal requested
+                     '((sessionId . "s1")
+                       (attachment . ((attachmentId . "sha256:abc")
+                                      (mediaType . "image/png"))))))
       (goto-char (point-min))
       (search-forward "[image]")
       (should (eq (car-safe (get-text-property (match-beginning 0) 'display)) 'image)))))
+
+(ert-deftest emacs-dsh-history-image-uses-complete-attachment-reference ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (setq-local emacs-dsh--session-id "s1")
+    (emacs-dsh--compose)
+    (let* ((ref '((attachmentId . "sha256:abc") (mediaType . "image/png")
+                  (bytes . 5) (width . 1) (height . 1) (name . "shot.png")))
+           (content `(((type . "image") (attachment . ,ref))))
+           requested success failure)
+      (cl-letf (((symbol-function 'emacs-dsh--call)
+                 (lambda (_endpoint args callback &optional on-error)
+                   (setq requested (alist-get 'request args)
+                         success callback failure on-error)))
+                ((symbol-function 'emacs-dsh--decode-image)
+                 (lambda (_mime data &rest _)
+                   (when data '(image :type png)))))
+        (emacs-dsh--insert-message "You: " "" t content)
+        (should (equal requested `((sessionId . "s1") (attachment . ,ref))))
+        ;; Settle asynchronously, after the field has moved.
+        (emacs-dsh--insert-before-input "More history")
+        (funcall success `((attachment . ,ref) (data . "aGVsbG8=")))
+        (goto-char (point-min))
+        (search-forward "[image]")
+        (let ((pos (match-beginning 0)))
+          (should (equal (get-text-property pos 'display) '(image :type png)))
+          (should (equal (alist-get 'data (get-text-property pos 'emacs-dsh-image))
+                         "aGVsbG8=")))
+        ;; Fetch failures must be visible rather than leaving a silent label.
+        (emacs-dsh--insert-message "You: " "" t content)
+        (funcall failure "attachment unavailable")
+        (goto-char (point-min))
+        (search-forward "[image]" nil t 2)
+        (should (string-match-p "attachment unavailable"
+                                (get-text-property (match-beginning 0) 'help-echo)))))))
 
 (ert-deftest emacs-dsh-mode-choices-and-blank-selection ()
   (should (equal (emacs-dsh--preset-choices
@@ -2378,6 +2430,9 @@
                    (funcall success '((attachment . ((mediaType . "image/png"))) (data . "aGVsbG8="))))))
         (emacs-dsh-open-image))
       (should (equal (car request) "session/attachment"))
+      (should (equal (alist-get 'request (cdr request))
+                     '((sessionId . "s1")
+                       (attachment . ((attachmentId . "a") (mediaType . "image/png"))))))
       (should (equal (alist-get 'data viewed) "aGVsbG8=")))))
 
 (ert-deftest emacs-dsh-ui-image-viewer-writes-binary-and-cleans-up ()

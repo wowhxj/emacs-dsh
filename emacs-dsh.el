@@ -1010,6 +1010,7 @@ receives a string.  Return a silent cancellation function."
 (defvar emacs-dsh-chat-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map emacs-dsh-mode-map)
+    (define-key map (kbd "i") #'emacs-dsh-copy-mode-return-to-input)
     map)
   "Keys in an emacs-dsh chat buffer.")
 
@@ -1017,6 +1018,7 @@ receives a string.  Return a silent cancellation function."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "S-<return>") #'newline)
     (define-key map (kbd "S-RET") #'newline)
+    (define-key map (kbd "i") #'self-insert-command)
     (make-composed-keymap (list map emacs-dsh-mode-map widget-field-keymap)))
   "Widget keymap for the DSH composer.")
 
@@ -1368,7 +1370,7 @@ The original characters remain in the transcript for copying and search."
 History blocks only reference an attachment; mark those for loading."
   (let ((image (emacs-dsh--decode-image (alist-get 'mediaType block)
                                         (alist-get 'data block)))
-        (attachment (alist-get 'attachmentId (alist-get 'attachment block))))
+        (attachment (alist-get 'attachment block)))
     (propertize "[image]" 'display image 'emacs-dsh-image block
                 'emacs-dsh-attachment attachment
                 'help-echo "C-c C-o: open in the system image viewer")))
@@ -1378,11 +1380,11 @@ History blocks only reference an attachment; mark those for loading."
   (let ((pos start))
     (while (setq pos (text-property-not-all pos end 'emacs-dsh-attachment nil))
       (let* ((next (next-single-property-change pos 'emacs-dsh-attachment nil end))
-             (id (get-text-property pos 'emacs-dsh-attachment))
+             (attachment (get-text-property pos 'emacs-dsh-attachment))
              (marker (copy-marker pos)))
         (emacs-dsh--call
          "session/attachment"
-         `((request . ((sessionId . ,emacs-dsh--session-id) (attachmentId . ,id))))
+         `((request . ((sessionId . ,emacs-dsh--session-id) (attachment . ,attachment))))
          (lambda (value)
            (when (marker-buffer marker)
              (let* ((mime (alist-get 'mediaType (alist-get 'attachment value)))
@@ -1394,7 +1396,13 @@ History blocks only reference an attachment; mark those for loading."
                (when-let* ((image (emacs-dsh--decode-image mime (alist-get 'data value))))
                  (put-text-property marker (+ marker (length "[image]")) 'display image))))
            (set-marker marker nil))
-         (lambda (_failure) (set-marker marker nil)))
+         (lambda (failure)
+           (when (marker-buffer marker)
+             (let ((inhibit-read-only t))
+               (put-text-property marker (+ marker (length "[image]"))
+                                  'help-echo (format "Image fetch failed: %s" failure)))
+             (message "emacs-dsh: image fetch failed: %s" failure))
+           (set-marker marker nil)))
         (setq pos next)))))
 
 (defvar emacs-dsh--external-image-files nil
@@ -1446,8 +1454,7 @@ History blocks only reference an attachment; mark those for loading."
       (emacs-dsh--call
        "session/attachment"
        `((request . ((sessionId . ,emacs-dsh--session-id)
-                     (attachmentId . ,(alist-get 'attachmentId
-                                                 (alist-get 'attachment block))))))
+                     (attachment . ,(alist-get 'attachment block)))))
        (lambda (value)
          (emacs-dsh--view-image
           `((mediaType . ,(alist-get 'mediaType (alist-get 'attachment value)))
