@@ -2036,6 +2036,69 @@
                                                   (contextWindow . 128000)))))))))
     (should (string-match-p "6.4k/128.0k" (emacs-dsh--header)))))
 
+(ert-deftest emacs-dsh-header-native-stats-snapshot-and-live-changes ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (setq-local emacs-dsh--session-id "s1" emacs-dsh--socket 'socket)
+    (emacs-dsh--on-frame
+     (current-buffer) 'socket
+     (make-websocket-frame
+      :payload
+      (json-serialize
+       '((type . "item") (streamId . "s1")
+         (value . ((type . "snapshot") (cursor . 0)
+                   (projections . ((values .
+                                    ((contextPressure . ((projectedTokens . 6400)
+                                                         (contextWindow . 128000)))
+                                     (sessionStats . ((turns . 3) (steps . 57)
+                                                      (decodeTokens . 730) (decodeMs . 10000)))
+                                     (tokenUsage . ((uncachedInputTokens . 20000)
+                                                    (cacheReadTokens . 980000)
+                                                    (cacheWriteTokens . 0)
+                                                    (outputTokens . 4600000)))))))))))))
+    (let ((header (emacs-dsh--header)))
+      (should (string-match-p "6.4k/128.0k" header))
+      (should (string-match-p "3轮 57步" header))
+      (should (string-match-p "73 tok/s" header))
+      (should (string-match-p "5.6M tok" header))
+      (should (string-match-p "缓存命中 98%" header)))
+    (emacs-dsh--control-item
+     '((type . "projection") (sessionId . "s1") (seq . 1)
+       (changes . [((key . "contextPressure")
+                    (val . ((projectedTokens . 12800) (contextWindow . 128000))))
+                   ((key . "sessionStats")
+                    (val . ((turns . 4) (steps . 60) (decodeMs . 0))))
+                   ((key . "tokenUsage") (val . nil))])))
+    (let ((header (emacs-dsh--header)))
+      (should (string-match-p "12.8k/128.0k" header))
+      (should (string-match-p "4轮 60步" header))
+      (should-not (string-match-p "tok/s\\|缓存命中\\|M tok" header)))
+    ;; Partial updates preserve other values and do not cross sessions.
+    (emacs-dsh--control-item
+     '((type . "projection") (sessionId . "other") (seq . 2)
+       (changes . (((key . "contextPressure") (val . nil))))))
+    (should (string-match-p "12.8k/128.0k" (emacs-dsh--header)))
+    (emacs-dsh--control-item
+     '((type . "projection") (sessionId . "s1") (seq . 3)
+       (changes . (((key . "contextPressure")
+                    (val . ((pressureTokens . 3200) (contextWindow . 128000))))))))
+    (should (string-match-p "3.2k/128.0k" (emacs-dsh--header)))))
+
+(ert-deftest emacs-dsh-usage-summary-cache-rounding-and-missing-data ()
+  (with-temp-buffer
+    (emacs-dsh-chat-mode)
+    (should (equal (emacs-dsh--usage-summary) ""))
+    (setq emacs-dsh--token-usage
+          '((uncachedInputTokens . 1) (cacheReadTokens . 9999)
+            (cacheWriteTokens . 0) (outputTokens . 0)))
+    (should (string-match-p "缓存命中 99.99%" (emacs-dsh--usage-summary)))
+    (setf (alist-get 'uncachedInputTokens emacs-dsh--token-usage) 0)
+    (should (string-match-p "缓存命中 100%" (emacs-dsh--usage-summary)))
+    (setf (alist-get 'cacheReadTokens emacs-dsh--token-usage) 0
+          (alist-get 'outputTokens emacs-dsh--token-usage) 42)
+    (should (string-match-p "42" (emacs-dsh--usage-summary)))
+    (should-not (string-match-p "缓存命中" (emacs-dsh--usage-summary)))))
+
 (ert-deftest emacs-dsh-header-permission-restored-from-follow-snapshot ()
   (with-temp-buffer
     (emacs-dsh-chat-mode)
