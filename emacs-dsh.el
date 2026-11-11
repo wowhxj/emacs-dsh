@@ -2915,24 +2915,16 @@ CHOOSE-MODE asks for an agent preset only if a new session is selected."
 
 (defun emacs-dsh--offer-root-sessions (items root choose-mode)
   "Pick one of ROOT's session ITEMS or create a new one with CHOOSE-MODE."
-  (let ((new-label "[New session] "))
+  (let ((new-label "[New session]"))
     (if (null items)
         (emacs-dsh--create-session-with-choice root choose-mode)
-      (let ((choices (append
-                      (mapcar (lambda (item)
-                                (cons (emacs-dsh--session-choice-label item)
-                                      item))
-                              items)
-                      (list (cons new-label :new)))))
+      (let ((choices (append (emacs-dsh--session-rows items)
+                             (list (cons new-label :new)))))
         (emacs-dsh--defer-picker
          (lambda ()
-           (let ((choice
-                  (cdr (assoc
-                        (let ((vertico-sort-function nil))
-                          (completing-read
-                           "Session in this directory (choose or create): "
-                           choices nil t))
-                        choices))))
+           (let ((choice (emacs-dsh--read-session
+                          "DSH session in this directory (choose or create): "
+                          choices)))
              (cond
               ((eq choice :new)
                (emacs-dsh--create-session-with-choice root choose-mode))
@@ -3196,28 +3188,12 @@ actual creation time.  Read all missing snapshots over one temporary socket."
                             (error-message-string err))
                    (finish))))))))
 
-(defun emacs-dsh--workspace-label (item)
-  "Return ITEM's working directory as a readable workspace label."
-  (let ((path (emacs-dsh--local-path (alist-get 'cwd item))))
-    (if (and (stringp path) (not (string-empty-p path)))
-        (abbreviate-file-name (directory-file-name path))
-      "(unknown)")))
-
 (defun emacs-dsh--resume-picker (items)
-  "Show sessions with compact ID and directory columns and a useful prompt."
-  (setq items (emacs-dsh--session-sort-newest items))
-  (let ((choices (mapcar (lambda (item)
-                           (cons (emacs-dsh--session-choice-label item)
-                                 item))
-                         items)))
+  "Pick one of the Host's session ITEMS in the shared session table."
+  (let ((choices (emacs-dsh--session-rows items)))
     (emacs-dsh--defer-picker
      (lambda ()
-       (when-let* ((choice (cdr (assoc
-                                  (let ((vertico-sort-function nil))
-                                     (completing-read
-                                      "Resume DSH (time | session ID | workspace | prompt): "
-                                      choices nil t))
-                                  choices))))
+       (when-let* ((choice (emacs-dsh--read-session "Resume DSH session: " choices)))
          (let ((source (current-buffer))
                (id (alist-get 'sessionId choice)))
            (when (or (not (derived-mode-p 'emacs-dsh-chat-mode))
@@ -3278,38 +3254,6 @@ actual creation time.  Read all missing snapshots over one temporary socket."
         (concat (truncate-string-to-width string head-width)
                 "…"
                 (truncate-string-to-width string total tail-start))))))
-
-(defun emacs-dsh--session-choice-label (item &optional _id-width _workspace-width)
-  "Format ITEM as date, shortened ID, directory, and prompt preview.
-
-The completion UI adapts to the current window width; compact columns preserve
-the identifying beginning and end of IDs and paths."
-  (let* ((values (alist-get 'values (alist-get 'projections item)))
-         (outline (alist-get 'turnOutline values))
-         (first-prompt (and outline (alist-get 'prompt (car outline))))
-         (title (alist-get 'title values))
-         (preview (cond ((and (stringp first-prompt)
-                             (not (string-empty-p first-prompt))) first-prompt)
-                        ((and (stringp title) (not (string-empty-p title))) title)
-                        (t "(empty session)")))
-         (clean (replace-regexp-in-string "[[:space:]\n\r]+" " " preview))
-         (id (alist-get 'sessionId item))
-         (short-id (emacs-dsh--middle-truncate id 18))
-         (workspace (emacs-dsh--middle-truncate (emacs-dsh--workspace-label item)
-                                                32))
-         (prompt-width (max 12 (min 76 (- (window-body-width) 48))))
-         (activity-time (emacs-dsh--session-time item))
-         (created (if (> activity-time 0)
-                      activity-time
-                    (let ((cached (gethash id emacs-dsh--created-at)))
-                      (if (numberp cached) (/ cached 1000.0) 0))))
-         (date (if (> created 0)
-                   (format-time-string "%Y-%m-%d %H:%M"
-                                       (seconds-to-time created))
-                 "unknown")))
-    (concat date "  " (format "%-18s" short-id) "  "
-            (format "%-32s" workspace) "  "
-            (truncate-string-to-width clean prompt-width nil nil "…"))))
 
 (defun emacs-dsh--model-candidates (catalog)
   "Return completion entries for the routable models in CATALOG."
@@ -4512,6 +4456,8 @@ titles or general activity for user messages."
                                      (alist-get 'turnOutline values))))
               (stamp (alist-get 'lastPromptAt (alist-get 'sessionListMetadata values)))
               (record (copy-alist candidate)))
+         (when (assq 'running item)
+           (setf (alist-get 'running record) (alist-get 'running item)))
          (setf (alist-get 'firstUserQuery record) (car prompts)
                (alist-get 'lastUserQuery record) (car (last prompts))
                (alist-get 'lastUserTime record)
@@ -4527,23 +4473,35 @@ titles or general activity for user messages."
                  width nil ?\s "…")))
     (if face (propertize column 'face face) column)))
 
-(defun emacs-dsh--session-reference-choices (sessions &optional width)
-  "Return aligned reference choices for SESSIONS within display WIDTH.
-Sort by the last user interaction, prioritizing first/latest user queries.
-The first label carries a column header for completion UIs."
+(defconst emacs-dsh--running-mark (propertize " ● running" 'face 'success)
+  "Suffix for sessions with a turn still running in the Host.")
+
+(defun emacs-dsh--session-reference-choices (sessions &optional width value)
+  "Return aligned session choices for SESSIONS within display WIDTH.
+Columns: last user time | first query | latest query | project (wide
+windows) | ID, with a running mark for sessions the Host reports running.
+Sort by the last user interaction; the first label carries a column header
+for completion UIs.  By default offer @session mentions for every session
+but the current one; resume pickers pass VALUE, a function from session to
+choice value, and keep every session, the current one included."
   (let* ((seen (make-hash-table :test #'equal))
          (records
           (cl-loop for item in sessions
                    for id = (alist-get 'sessionId item)
                    for mention = (alist-get 'mention item)
-                   when (and (stringp id) (not (equal id emacs-dsh--session-id))
-                             (stringp mention) (string-prefix-p "@[" mention)
-                             (string-match-p "(dsh-session:" mention)
-                             (not (gethash id seen)))
+                   when (and (stringp id) (not (gethash id seen))
+                             (or value
+                                 (and (not (equal id emacs-dsh--session-id))
+                                      (stringp mention) (string-prefix-p "@[" mention)
+                                      (string-match-p "(dsh-session:" mention))))
                    collect (progn (puthash id t seen) item)))
+         (value (or value (lambda (item) (alist-get 'mention item))))
          (ids (mapcar (lambda (item) (alist-get 'sessionId item)) records))
          (id-width 12)
-         (width (or width (- (window-body-width (minibuffer-window)) 4))))
+         (running (seq-some (lambda (item) (eq (alist-get 'running item) t)) records))
+         ;; Leave room for the running mark so marked rows still fit.
+         (width (- (or width (- (window-body-width (minibuffer-window)) 4))
+                   (if running (string-width emacs-dsh--running-mark) 0))))
     (while (not (= (length
                     (delete-dups
                      (mapcar (lambda (id)
@@ -4584,10 +4542,42 @@ The first label carries a column header for completion UIs."
                                     (alist-get 'firstUserQuery item)
                                     (alist-get 'lastUserQuery item)
                                     (when-let* ((cwd (alist-get 'cwd item)))
-                                      (abbreviate-file-name cwd))
+                                      (abbreviate-file-name
+                                       (or (emacs-dsh--local-path cwd) cwd)))
                                     (alist-get 'sessionId item))
-               collect (cons (propertize label 'emacs-dsh-session-header header)
-                             (alist-get 'mention item))))))
+               collect (cons (propertize
+                              (concat label (when (eq (alist-get 'running item) t)
+                                              emacs-dsh--running-mark))
+                              'emacs-dsh-session-header header)
+                             (funcall value item))))))
+
+(defun emacs-dsh--read-session (prompt choices)
+  "Read one of session CHOICES with PROMPT under their column header.
+CHOICES come from `emacs-dsh--session-reference-choices', optionally
+followed by extra rows such as a new-session entry; return the chosen value."
+  (let* ((header (get-text-property 0 'emacs-dsh-session-header (caar choices)))
+         (table (completion-table-with-metadata
+                 choices
+                 `((category . emacs-dsh-session)
+                   (display-sort-function . identity)
+                   (cycle-sort-function . identity)
+                   (group-function . ,(lambda (candidate transform)
+                                        (if transform candidate header))))))
+         ;; Column headers must not inherit Vertico's group decoration.
+         (vertico-group-format "%s")
+         (completion-styles (append completion-styles
+                                    (unless (memq 'substring completion-styles)
+                                      '(substring))))
+         (completion-ignore-case t)
+         (orderless-smart-case nil))
+    (cdr (assoc (completing-read prompt table nil t) choices))))
+
+(defun emacs-dsh--session-rows (items)
+  "Return resume picker choices for Host session ITEMS, valued by item."
+  (emacs-dsh--session-reference-choices
+   (emacs-dsh--session-reference-details
+    (emacs-dsh--session-sort-newest items) items)
+   nil #'identity))
 
 (defun emacs-dsh--reference-file-choice (item)
   "Format Host or local file ITEM with an explicit directory slash."
@@ -4656,7 +4646,7 @@ The first label carries a column header for completion UIs."
                                                 "directory" "file")))))))
            (dolist (choice choices) (puthash (car choice) (cdr choice) values))
            (let* ((selected (completing-read
-                             (if session-p "DSH @ session: " "DSH @ path: ")
+                             (if session-p "DSH session reference: " "DSH @ path: ")
                              collection nil t query))
                   (mention (gethash selected values)))
              (when mention (emacs-dsh--replace-completion context mention))))))))))
