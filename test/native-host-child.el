@@ -1,0 +1,117 @@
+;;; native-host-child.el --- Disposable managed Host client -*- lexical-binding: t; -*-
+(require 'emacs-dsh)
+
+(defun emacs-dsh-smoke--wait (predicate)
+  "Service process filters until PREDICATE holds, with a bounded deadline."
+  (let ((deadline (+ (float-time) 15)))
+    (while (and (not (funcall predicate)) (< (float-time) deadline))
+      (accept-process-output nil 0.02))
+    (unless (funcall predicate) (error "Managed Host smoke deadline exceeded"))))
+
+(let* ((root (getenv "EMACS_DSH_SMOKE_ROOT"))
+       (mode (getenv "EMACS_DSH_SMOKE_MODE"))
+       (real (equal (getenv "EMACS_DSH_SMOKE_REAL") "1"))
+       (emacs-dsh-connection-mode 'managed)
+       (emacs-dsh-managed-persistent t)
+       (emacs-dsh-managed-command
+        (if real (or (getenv "DSH_EXECUTABLE") "dsh") (expand-file-name "fixture-dsh" root)))
+       (emacs-dsh-managed-home (expand-file-name (if real "home" "fixture-home") root))
+       (emacs-dsh-managed-directory root)
+       (emacs-dsh-runtime-directory (expand-file-name "run" root))
+       connection failure result chat selected)
+  (unless (equal mode "resume")
+    (emacs-dsh--managed-start
+     (lambda (value error) (setq connection value failure error)))
+    (emacs-dsh-smoke--wait (lambda () (or connection failure)))
+    (when failure (error "Managed launch failed: %s" failure))
+    (when real
+      (emacs-dsh-create-session
+       root :display 'none
+       :on-ready (lambda (buffer)
+                   (setq chat buffer selected (buffer-local-value 'emacs-dsh--session-id buffer)))
+       :on-error (lambda (error) (setq failure error)))
+      (emacs-dsh-smoke--wait (lambda () (or chat failure)))
+      (when failure (error "Isolated session creation failed: %s" failure))
+      (with-temp-file (expand-file-name "selected-id" root) (insert selected))
+      (with-current-buffer chat (emacs-dsh-quit))
+      (setq chat nil)))
+  ;; A new Emacs MUST enumerate an existing managed Host without invoking startup.
+  (emacs-dsh-list-sessions
+   (lambda (value) (setq result value)) :on-error (lambda (error) (setq failure error)))
+  (emacs-dsh-smoke--wait (lambda () (or result failure)))
+  (when failure (error "Existing Host metadata failed: %s" failure))
+  (unless (or real (= 1 (length (plist-get result :items))))
+    (error "Unexpected fixture session count"))
+  (let (public-state)
+    (emacs-dsh-inspect-host (lambda (value) (setq public-state value))
+                            :on-error (lambda (error) (setq failure error)))
+    (emacs-dsh-smoke--wait (lambda () (or public-state failure)))
+    (when failure (error "Public existing Host inspection failed"))
+    (unless (and (equal (plist-get public-state :status) "running")
+                 (equal (plist-get public-state :source) (plist-get result :source))
+                 (eq (plist-get (plist-get public-state :capabilities) :quit) 'detach)
+                 (not (plist-get (plist-get public-state :capabilities) :finish-session))
+                 (eq (plist-get public-state :activity) 'unknown))
+      (error "Public runtime facts or lifecycle semantics differed"))
+    (when (and connection (string-match "[?]token=\\([^&]+\\)" (cadr connection))
+               (string-match-p (regexp-quote (match-string 1 (cadr connection)))
+                               (prin1-to-string public-state)))
+      (error "Public Host inspection exposed a launch credential")))
+  (when real
+    (let ((id (or selected (with-temp-buffer
+                             (insert-file-contents (expand-file-name "selected-id" root)) (buffer-string)))) activity)
+      (emacs-dsh-inspect-session-activity id (lambda (value) (setq activity value))
+                                          :on-error (lambda (error) (setq failure error)))
+      (emacs-dsh-smoke--wait (lambda () (or activity failure)))
+      (when failure
+        (let (diagnostic)
+          (emacs-dsh--request
+           "session/wait" `((request . ((sessionId . ,id) (timeoutMs . 250) (afterSeq . 9007199254740991) (maxMessages . 1))))
+           (lambda (value error)
+             (let ((state (alist-get 'state value)))
+               (setq diagnostic (list :rpc-error (and error t)
+                                      :code (and error (if (string-match "\\`\\([A-Za-z0-9/_-]+\\):" error)
+                                                          (match-string 1 error) "transport"))
+                                      :reason (alist-get 'reason value)
+                                      :fields (mapcar #'car state) :active (alist-get 'active state)
+                                      :running (alist-get 'running state) :queue-type (type-of (alist-get 'queue state))
+                                      :pending-type (type-of (alist-get 'pendingInput state)))))) t)
+          (emacs-dsh-smoke--wait (lambda () diagnostic))
+          (error "Real passive idle inspection failed (sanitized shape): %S" diagnostic)))
+      (unless (and (eq (plist-get activity :activity) 'idle)
+                   (= (plist-get activity :queue-count) 0) (= (plist-get activity :pending-input-count) 0)
+                   (equal (plist-get activity :session-id) id)
+                   (equal (plist-get activity :source) (plist-get result :source)))
+        (error "Isolated blank session did not have a proven passive idle state: %S" activity))))
+  (when (equal mode "resume")
+    (when emacs-dsh--managed-process (error "Read-only scan unexpectedly created startup helper"))
+    (emacs-dsh--managed-start
+     (lambda (value error) (setq connection value failure error)))
+    (emacs-dsh-smoke--wait (lambda () (or connection failure)))
+    (when failure (error "Existing Host attach failed: %s" failure))
+    (when real
+      (setq selected (with-temp-buffer
+                       (insert-file-contents (expand-file-name "selected-id" root))
+                       (buffer-string)))
+      (emacs-dsh-open-session
+       selected :directory root :display 'none
+       :on-ready (lambda (buffer) (setq chat buffer))
+       :on-error (lambda (error) (setq failure error)))
+      (emacs-dsh-smoke--wait (lambda () (or chat failure)))
+      (when failure
+        (let ((failed-buffer (gethash selected emacs-dsh--chats)))
+          (error "Isolated exact session restore failed: %s; expected cwd=%S observed=%S"
+                 failure root (and (buffer-live-p failed-buffer)
+                                   (buffer-local-value 'emacs-dsh--verified-session failed-buffer)))))
+      (unless (equal selected (buffer-local-value 'emacs-dsh--session-id chat))
+        (error "Restored a different session"))
+      (with-current-buffer chat (emacs-dsh-quit))))
+  (unless (equal (nth 2 connection) (nth 1 (plist-get result :source)))
+    (error "Managed Host generation changed across discovery/attach"))
+  (with-temp-file (expand-file-name (concat mode "-result.json") root)
+    (insert (json-serialize `((generation . ,(nth 2 connection))
+                              (count . ,(length (plist-get result :items)))))))
+  (with-temp-file (expand-file-name "armed" root) (insert "connected"))
+  (if (equal mode "crash")
+      (while t (accept-process-output nil 0.1))
+    (kill-emacs 0)))

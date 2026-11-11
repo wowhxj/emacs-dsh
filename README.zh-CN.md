@@ -12,9 +12,25 @@
 | --- | --- | --- | --- |
 | `auto`（默认） | 检测到 bridge 文件时优先复用 Desktop，否则由 Emacs 启动 Web Host | 使用 Desktop 时安装 [emacs-dsh-host-bridge](https://github.com/wowhxj/emacs-dsh-host-bridge)；回退启动时需有 `dsh` CLI | 跟随实际选中的 Host |
 | `desktop` | 始终复用 DSH Desktop Host 及其 profile | 安装并启用独立 Host bridge | 由 Desktop 管理；Emacs 不负责启动 |
-| `managed` | 始终由 Emacs 启动本机 Web Host | Emacs 所在系统中能运行 `dsh` CLI | 首次连接时启动 `dsh web`，退出 Emacs 时结束该进程 |
+| `managed` | 始终由 Emacs 启动本机 Web Host | Emacs 所在系统中能运行 `dsh` CLI | 启动/发现独立 owner；退出 Emacs 仅断开连接 |
 
 两种 Host 都只连接本机 `127.0.0.1`。自动模式以 bridge 文件作为 Desktop Host 可用的信号；文件存在但损坏或无效时会报告错误，不会悄悄启动另一个 Host。托管 Host 用 `dsh web --host 127.0.0.1 --port 0 --no-open` 启动，从输出取得一次性 URL，并换取 Host 签名 cookie。`--port 0` 由系统选择空闲端口。bridge 与 Emacs 包分别安装和更新。**两个 Host 使用不同的 profile，会话、模型设置与技能配置不一定相同。**
+
+## 持久托管所有权
+
+managed 模式默认 `emacs-dsh-managed-persistent` 为 t，后台独立于 Emacs 存活。
+随包 `emacs-dsh-host.mjs` 需要 POSIX 上的 Node.js **22.19+**，仅用标准库、不需 npm
+安装；它和 `emacs-dsh-runtime.el` 必须与 `emacs-dsh.el` 同目录，只复制 Lisp 不完整。
+显式设置为 nil 才退回旧的 Emacs 托管启动。Desktop 的所有权/认证保持独立，不依赖这个
+managed supervisor。
+
+聊天 `C-c C-q` 只关闭/断开 UI，不取消任务、不停止 Host、不归档或删除历史。
+`emacs-dsh-disconnect-managed-host` 在关闭聊天后断开 managed 连接；独立的确认命令
+`emacs-dsh-shutdown-managed-host` 才会停止这个 managed Host 及其全部工作，绝不用于
+Desktop。没有安装 finish 插件。
+
+当前工作树开发变更须发布后才能被远端安装取得，不会自动热更新现有包或配置。
+详见 [公开所有权与活动状态 API](PUBLIC-API.md)。
 
 ## 安装
 

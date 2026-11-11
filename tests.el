@@ -834,7 +834,10 @@
                "dsh web: http://127.0.0.1:99999/?token=secret")))
 
 (ert-deftest emacs-dsh-managed-start-shares-one-process ()
-  (let ((emacs-dsh--managed-process nil)
+  ;; This unit fixture covers the explicit legacy launcher, not the Node supervisor.
+  (let ((emacs-dsh-managed-persistent nil)
+        (emacs-dsh--managed-source-key nil)
+        (emacs-dsh--managed-process nil)
         (emacs-dsh--managed-connection nil)
         (emacs-dsh--managed-output "")
         (emacs-dsh--managed-waiters nil)

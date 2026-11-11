@@ -1,5 +1,94 @@
 # Public session APIs (development)
 
+## Inspect existing Host runtime facts and ownership capabilities
+
+```elisp
+(emacs-dsh-runtime-capabilities) ; pure configured semantics; no auth/startup
+(setq cancel-runtime
+      (emacs-dsh-inspect-host
+       (lambda (state) (message "%S" state))
+       :on-error (lambda (diagnostic) (message "%s" diagnostic))))
+```
+
+`emacs-dsh-runtime-capabilities` returns `:mode`, `:ownership` (`external`,
+`independent`, `emacs`, or `unknown`), `:configured-persistence`, `:quit detach`,
+`:finish-session nil`, `:shutdown-host`, and `:activity unknown`. These are
+**configured client capabilities, not proof a Host exists**. Desktop is
+externally owned. Persistent managed Hosts are independently owned; legacy
+managed mode remains explicitly Emacs-owned. The separate confirmed managed
+Host shutdown command is not a per-session finish operation and never targets
+Desktop. Chat `C-c C-q` remains UI detach only.
+
+`emacs-dsh-inspect-host` uses only existing-Host metadata authentication and
+`session/list`. It does not start/stop a Host, activate a session, acquire a
+chat/interaction claim, open a buffer, archive, or send a prompt. It returns a
+silent cancellation function and a sanitized plist:
+
+- `:status "running"`: the selected Host answered; not model generation.
+- `:source`: the authenticated `(base generation mode)` identity without launch
+  credentials; consumers must compare it with the history's source identity.
+- `:capabilities`: the configured semantics above.
+- `:sessions`: plists containing `:session-id`, `:backend-state`, `:activity`.
+- `:coverage listed-only` and `:activity unknown`.
+
+For each returned row, explicit `running=true` becomes `present`, explicit
+`running=false` becomes `not-running`, and missing/malformed flags become
+`unknown`. **Neither not-running nor an omitted ID proves model idle, drained
+inbox/approvals, or globally absent sessions.** Activity remains unknown. No
+transcript, prompt, title, launch URL, cookie, token or raw error is returned.
+Failed/changed/malformed sources call the generic error callback, not an
+absence callback. Cache consumers must guard configuration/generation changes
+and freshness. Busy/idle scheduling needs stronger evidence than this API.
+
+Isolated real managed-Host/independent-Emacs probes exercise this API and verify
+that UI quit and fresh metadata inspection retain the same Host generation.
+They do not validate every real model, queue, or approval workflow. No user
+Desktop/configuration or installed package is modified by these probes.
+
+## Inspect exact-session passive quiescence
+
+```elisp
+(setq cancel-activity
+      (emacs-dsh-inspect-session-activity
+       "FULL-SESSION-ID"
+       (lambda (sample) (message "%S" sample))
+       :on-error (lambda (diagnostic) (message "%s" diagnostic))))
+```
+
+Requires the native `session/wait` API. Existing Host authentication only;
+no startup, activation, chat/interaction claim, prompt, reply, archive, cancel,
+or finish. Cancellation closes this observation only, never Agent execution.
+The native wait is 250 ms; client deadline 4 seconds; typed response parsing
+rejects bodies larger than 8 MiB. `afterSeq=Number.MAX_SAFE_INTEGER` and
+`maxMessages=1` suppress assistant-output retrieval/scanning. Native state may
+transport queued context transiently; the callback never exposes its content.
+
+The allowlisted result contains `:source`, `:session-id`, `:activity`, `:active`,
+`:running`, `:cursor`, `:queue-count`, `:context-count`, `:pending-input-count`.
+Activity is `idle`, `busy`, `input-required`, or `unknown`:
+
+- **idle** requires the native idle stopping reason, complete typed false/null/
+  array fields, no running inference, no queued/steering user items, and no
+  pending Remote approval/question/other input. For active Agents, native
+  `whenIdle()` and current Agent/session/revision checks establish quiescence;
+  `running=false` alone does not. Inactive state has no active queue (`null`),
+  not a claim about every persisted inbox projection.
+- Context-only next-step items are dormant non-user context, counted separately
+  from actionable queued/steering input. They may remain even in a newly
+  created empty session; native driver quiescence is still required.
+- Pending input or an actionable queue blocks idle even if a contradictory
+  native idle reason is returned. Timeout without such facts stays unknown.
+- Missing/unsupported/inconsistent state or source-generation changes invoke
+  the generic error callback; never infer idle from an error or omitted ID.
+
+This is a sample at a particular cursor, not an exclusive reservation against
+future writers. Consumers must bind configuration/source/session, expire it,
+refresh during long jobs and revalidate the sample plus history revision when
+accepting results. The real isolated Host tests prove empty-session idle and
+preserved generation across normal/SIGKILL Emacs exits; controlled schemas test
+busy/queue/approval negatives. They do **not** replace real model/approval-flow
+acceptance. Desktop ownership and chat quit=detach remain unchanged.
+
 ## Create without a history picker
 
 ```elisp

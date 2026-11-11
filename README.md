@@ -13,9 +13,28 @@ An Emacs client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-h
 | --- | --- | --- | --- |
 | `auto` (default) | Reuse the Desktop Host if a bridge file is present; otherwise start a Web Host from Emacs | For Desktop, install [emacs-dsh-host-bridge](https://github.com/wowhxj/emacs-dsh-host-bridge); for the fallback, make the `dsh` CLI available | Follows the selected Host |
 | `desktop` | Always reuse the DSH Desktop Host and its profile | Install and enable the separate Host bridge | Managed by Desktop; Emacs does not start the Host |
-| `managed` | Always let Emacs start a local Web Host | The `dsh` CLI must run in Emacs's operating system | Starts on first use and stops when Emacs exits |
+| `managed` | Always let Emacs start a local Web Host | The `dsh` CLI must run in Emacs's operating system | Starts/discovers an independent owner; Emacs exit only detaches |
 
 Both Host types connect only to local `127.0.0.1`. In automatic mode, the bridge file is the signal that Desktop is available: a present but invalid or broken bridge reports an error rather than silently starting a second Host. Managed mode runs `dsh web --host 127.0.0.1 --port 0 --no-open`, discovers its one-time URL, and exchanges it for a Host-signed cookie. Port `0` lets the OS choose an available port. The bridge and Emacs package are installed and updated separately. **The two Hosts have different profiles, so sessions, models, and skills may differ.**
+
+## Persistent managed ownership
+
+Managed mode defaults to `emacs-dsh-managed-persistent` = t. Its bundled
+`emacs-dsh-host.mjs` supervisor requires Node.js **22.19+** on POSIX and no npm
+install. Keep that file and `emacs-dsh-runtime.el` beside `emacs-dsh.el`; copying
+only Lisp files is incomplete. Explicit nil opts into legacy Emacs-owned startup.
+Desktop ownership and authentication remain independent and do not require the
+managed supervisor.
+
+Chat `C-c C-q` only closes/detaches its UI: it does not cancel tasks, stop the
+Host, archive or delete history. `emacs-dsh-disconnect-managed-host` detaches the
+managed connection after chats close. The separate confirmed
+`emacs-dsh-shutdown-managed-host` stops that managed Host and all its work;
+it never targets Desktop. No finish plugin is installed.
+
+Current source changes must be published before remote installs include them;
+this work does not hot-update existing packages/configuration. See
+[public ownership/activity contracts](PUBLIC-API.md) for unknown-state behavior.
 
 ## Installation
 

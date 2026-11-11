@@ -33,6 +33,7 @@
 (defvar emacs-dsh--queue-buffer)        ; queue panel defined below
 
 (defgroup emacs-dsh nil "Emacs client for DeepSeek Harness." :group 'tools)
+(require 'emacs-dsh-runtime)
 (defface emacs-dsh-status-face
   '((t :inherit mode-line))
   "Face for the DSH mode-line status." :group 'emacs-dsh)
@@ -58,15 +59,15 @@
 (defcustom emacs-dsh-connection-mode 'auto
   "How Emacs connects to a local DSH Host.
 `auto' prefers the local Desktop bridge file when present, otherwise starts
-and owns a `dsh web' process.  This is the default.
-`managed' starts and owns a `dsh web' process in Emacs's operating system.
+an independently owned `dsh web' Host.  This is the default.
+`managed' joins or starts a persistent `dsh web' Host in Emacs's OS.
 `desktop' uses the separately installed Host bridge to join DSH Desktop."
   :type '(choice (const :tag "Prefer Desktop bridge, otherwise dsh web" auto)
-                 (const :tag "Emacs-managed dsh web" managed)
+                 (const :tag "Independent managed dsh web" managed)
                  (const :tag "Existing Desktop Host via bridge" desktop))
   :group 'emacs-dsh)
 (defcustom emacs-dsh-managed-command "dsh"
-  "Executable used to start the Emacs-managed DSH Web Host.
+  "Executable used to start the independently managed DSH Web Host.
 Set an absolute path if `dsh' is not on Emacs's PATH."
   :type 'string :group 'emacs-dsh)
 (defcustom emacs-dsh-url "http://127.0.0.1:19387/"
@@ -110,7 +111,9 @@ The fallback is used only when the Host does not offer auto."
 (defvar emacs-dsh--authenticated-mode nil "Connection mode for the current cookie.")
 (defvar emacs-dsh--auth-waiters nil "Callbacks waiting for automatic authentication.")
 (defvar emacs-dsh--auth-running nil "Non-nil while an authentication attempt is in progress.")
-(defvar emacs-dsh--managed-process nil "DSH Web Host process owned by this Emacs.")
+(defvar emacs-dsh--managed-process nil
+  "Local Host-connection helper; persistent backend is independently owned.")
+(defvar emacs-dsh--managed-source-key nil "Configuration fingerprint of the connected managed Host.")
 (defvar emacs-dsh--managed-connection nil "Current managed (base launch nonce) tuple.")
 (defvar emacs-dsh--managed-output "" "Bounded startup output before a launch URL arrives.")
 (defvar emacs-dsh--managed-waiters nil "Callbacks waiting for managed Host startup.")
@@ -206,10 +209,11 @@ The fallback is used only when the Host does not offer auto."
         (setq-local url-cookie-file nil)))
     buffer))
 
-(defun emacs-dsh--request (endpoint args callback)
+(defun emacs-dsh--request (endpoint args callback &optional typed)
   "Call DSH Remote ENDPOINT with named ARGS; pass result/error to CALLBACK.
 CALLBACK receives (VALUE ERROR), exactly once.  Always execute it in the
-buffer that initiated the call, if that buffer is still alive."
+buffer that initiated the call, if that buffer is still alive.
+TYPED preserves JSON arrays, false and null for strict read-only proofs."
   (when (and emacs-dsh--source
              (not (equal emacs-dsh--source (emacs-dsh--source-identity))))
     (user-error "DSH chat belongs to another Host generation"))
@@ -246,9 +250,12 @@ buffer that initiated the call, if that buffer is still alive."
                      (error "DSH HTTP %s (check local Host connection)" (match-string 1)))
                    (unless (re-search-forward "\r?\n\r?\n" nil t)
                      (error "Missing response body"))
+                   (when (and typed (> (buffer-size) (* 8 1024 1024)))
+                     (error "Read-only state response exceeds its limit"))
                    (let* ((reply (json-parse-buffer :object-type 'alist
-                                                    :array-type 'list
-                                                    :null-object nil :false-object nil))
+                                                    :array-type (if typed 'array 'list)
+                                                    :null-object (and typed :json-null)
+                                                    :false-object (and typed :json-false)))
                           (result (alist-get 'result reply)))
                      (unless (and (equal (alist-get 'type reply) "server-response")
                                   (equal (alist-get 'rpcId reply) id) result)
@@ -433,21 +440,29 @@ Rows that already carry turnOutline (older Hosts) are returned unchanged."
              (not emacs-dsh--managed-connection))
     (setq emacs-dsh--managed-output
           (concat emacs-dsh--managed-output output))
-    (if-let* ((launch (emacs-dsh--managed-parse-launch emacs-dsh--managed-output)))
+    (if-let* ((complete (or (not (and (processp process) (process-get process 'emacs-dsh-persistent)))
+                            (string-match-p "[?]token=[A-Za-z0-9_-]+[\r\n]"
+                                            emacs-dsh--managed-output)))
+              (launch (and complete (emacs-dsh--managed-parse-launch emacs-dsh--managed-output))))
         (progn
           (when emacs-dsh--managed-timer
             (cancel-timer emacs-dsh--managed-timer)
             (setq emacs-dsh--managed-timer nil))
-          (setq emacs-dsh--managed-output ""
-                emacs-dsh--managed-connection
-                (append launch (list (emacs-dsh--uuid))))
+          (let ((generation
+                 (and (string-match "emacs-dsh generation: \\([A-Za-z0-9-]+\\)"
+                                    emacs-dsh--managed-output)
+                      (match-string 1 emacs-dsh--managed-output))))
+            (setq emacs-dsh--managed-output ""
+                  emacs-dsh--managed-connection
+                  (append launch (list (or generation (emacs-dsh--uuid))))))
           (emacs-dsh--managed-notify emacs-dsh--managed-connection nil))
       (when (> (length emacs-dsh--managed-output) 8192)
         (setq emacs-dsh--managed-output
               (substring emacs-dsh--managed-output -8192))))))
 
 (defun emacs-dsh--managed-sentinel (process _event)
-  "Forget PROCESS if the managed Host exits."
+  "Forget the local helper PROCESS when its connection exits.
+This alone does not prove that a persistent managed Host has stopped."
   (when (and (eq process emacs-dsh--managed-process)
              (not (process-live-p process)))
     (when emacs-dsh--managed-timer
@@ -458,11 +473,15 @@ Rows that already carry turnOutline (older Hosts) are returned unchanged."
           emacs-dsh--managed-output "")
     (emacs-dsh--invalidate-auth)
     (emacs-dsh--managed-notify nil
-                               "Emacs-managed DSH Host exited; check dsh web availability")))
+                               "Managed Host client disconnected; reconnect to inspect the Host")))
 
 (defun emacs-dsh--managed-start (callback)
   "Call CALLBACK with (connection error), starting a local Host if needed."
   (cond
+   ((and emacs-dsh-managed-persistent emacs-dsh--managed-source-key
+         (not (equal emacs-dsh--managed-source-key
+                     (ignore-errors (emacs-dsh-runtime-key)))))
+    (funcall callback nil "Managed Host configuration changed; detach before switching sources"))
    ((and emacs-dsh--managed-process
          (process-live-p emacs-dsh--managed-process)
          emacs-dsh--managed-connection)
@@ -483,11 +502,16 @@ Rows that already carry turnOutline (older Hosts) are returned unchanged."
             (setq emacs-dsh--managed-process
                   (make-process
                    :name "emacs-dsh-web" :buffer nil :noquery t
-                   :command (list program "web" "--host" "127.0.0.1"
-                                  "--port" "0" "--no-open")
-                   :coding 'utf-8-unix
+                   :command (if emacs-dsh-managed-persistent
+                                (emacs-dsh-runtime-command "connect")
+                              (cons program emacs-dsh-managed-arguments))
+                   :connection-type 'pipe :coding 'utf-8-unix
                    :filter #'emacs-dsh--managed-filter
                    :sentinel #'emacs-dsh--managed-sentinel))
+            (when emacs-dsh-managed-persistent
+              (process-put emacs-dsh--managed-process 'emacs-dsh-persistent t))
+            (setq emacs-dsh--managed-source-key
+                  (and emacs-dsh-managed-persistent (emacs-dsh-runtime-key)))
             (let ((process emacs-dsh--managed-process))
               (setq emacs-dsh--managed-timer
                     (run-at-time
@@ -506,19 +530,60 @@ Rows that already carry turnOutline (older Hosts) are returned unchanged."
          (emacs-dsh--managed-notify nil (error-message-string err))))))))
 
 (defun emacs-dsh--managed-stop ()
-  "Stop only the DSH Web Host process owned by this Emacs."
+  "Detach this Emacs's managed Host helper, not the persistent Host.
+Legacy non-persistent mode still stops its directly owned dsh process."
   (when emacs-dsh--managed-timer
     (cancel-timer emacs-dsh--managed-timer)
     (setq emacs-dsh--managed-timer nil))
   (let ((process emacs-dsh--managed-process))
     (setq emacs-dsh--managed-process nil
           emacs-dsh--managed-connection nil
+          emacs-dsh--managed-source-key nil
           emacs-dsh--managed-output "")
     (when (and process (process-live-p process)) (delete-process process)))
   (emacs-dsh--invalidate-auth)
-  (emacs-dsh--managed-notify nil "Emacs-managed DSH Host stopped"))
+  (emacs-dsh--managed-notify nil "Managed Host client disconnected"))
 
 (add-hook 'kill-emacs-hook #'emacs-dsh--managed-stop)
+
+;;;###autoload
+(defun emacs-dsh-disconnect-managed-host ()
+  "Detach the managed helper before changing profile settings.
+Close chat buffers first.  Persistent Host tasks continue independently."
+  (interactive)
+  (unless (eq (emacs-dsh--effective-mode) 'managed)
+    (user-error "Select managed mode before disconnecting its helper"))
+  (when (seq-some #'buffer-live-p (hash-table-values emacs-dsh--chats))
+    (user-error "Close chat buffers before changing managed Host profiles"))
+  (when (and (process-live-p emacs-dsh--managed-process)
+             (not (process-get emacs-dsh--managed-process 'emacs-dsh-persistent)))
+    (user-error "A legacy Emacs-owned Host cannot be detached safely"))
+  (emacs-dsh--managed-stop)
+  (message "emacs-dsh: client detached; persistent Host remains running"))
+
+;;;###autoload
+(defun emacs-dsh-shutdown-managed-host ()
+  "Explicitly stop the selected managed Host and all work it owns.
+This is separate from C-c C-q, which only closes a chat.  Desktop Hosts
+are never stopped by this command.  History remains on disk."
+  (interactive)
+  (unless (eq (emacs-dsh--effective-mode) 'managed)
+    (user-error "This command never stops a Desktop Host"))
+  (unless emacs-dsh-managed-persistent
+    (user-error "This command requires an independently managed Host"))
+  (when (and emacs-dsh--managed-source-key
+             (not (equal emacs-dsh--managed-source-key (emacs-dsh-runtime-key))))
+    (user-error "Managed Host configuration changed; refusing a different Host"))
+  (unless (yes-or-no-p "Stop this managed Host and ALL its tasks/clients (history retained)? ")
+    (user-error "Managed Host retained"))
+  (let ((source-key emacs-dsh--managed-source-key))
+    (emacs-dsh-runtime-shutdown
+     (lambda (_state failure)
+       (if failure
+           (message "emacs-dsh: %s" failure)
+         (when (equal source-key emacs-dsh--managed-source-key)
+           (emacs-dsh--managed-stop))
+         (message "emacs-dsh: managed Host stopped; history retained"))))))
 
 (defun emacs-dsh--effective-mode ()
   "Return the Host mode selected by `emacs-dsh-connection-mode'.
@@ -613,7 +678,7 @@ An existing but invalid bridge must fail validation, not silently fall back."
                 (lambda (cookie error)
                   (if (and (eq mode 'managed)
                            (not (equal connection emacs-dsh--managed-connection)))
-                      (emacs-dsh--auth-finish "Emacs-managed DSH Host restarted; retry")
+                      (emacs-dsh--auth-finish "Managed Host connection changed; retry")
                     (setq emacs-dsh--cookie-jar cookie
                           emacs-dsh--authenticated-base (and cookie (car connection))
                           emacs-dsh--authenticated-nonce (and cookie (caddr connection))
@@ -629,9 +694,14 @@ An existing but invalid bridge must fail validation, not silently fall back."
               (pcase mode
                 ('desktop (emacs-dsh--bridge-launch))
                 ('managed
+                 (when (and emacs-dsh-managed-persistent emacs-dsh--managed-source-key
+                            (not (equal emacs-dsh--managed-source-key (emacs-dsh-runtime-key))))
+                   (error "Managed Host configuration changed"))
                  (unless (and (process-live-p emacs-dsh--managed-process)
                               emacs-dsh--managed-connection)
-                   (error "Managed Host is not running"))
+                   (unless emacs-dsh-managed-persistent (error "Managed Host is not running"))
+                   (setq emacs-dsh--managed-connection (emacs-dsh-runtime-existing-connection)
+                         emacs-dsh--managed-source-key (emacs-dsh-runtime-key)))
                  emacs-dsh--managed-connection)
                 (_ (error "Invalid connection mode")))))
         (if emacs-dsh--auth-running
@@ -696,6 +766,152 @@ require validation against the configured Host version."
                  (error (finish nil "DSH metadata transport failed"))))))))
       (lambda () (setq done t) (when timer (cancel-timer timer))))))
 
+(defun emacs-dsh--same-host-directory-p (expected actual)
+  "Compare verified Host directory ACTUAL with EXPECTED, including local aliases.
+Foreign Windows paths still require exact matching; local inode identity
+handles macOS /tmp versus /private/tmp without trusting default-directory."
+  (and (stringp expected) (stringp actual)
+       (or (equal (directory-file-name expected) (directory-file-name actual))
+           (and (file-name-absolute-p expected) (file-name-absolute-p actual)
+                (not (file-remote-p expected)) (not (file-remote-p actual))
+                (file-directory-p expected) (file-directory-p actual)
+                (condition-case nil (file-equal-p expected actual) (error nil))))))
+
+;;;###autoload
+(defun emacs-dsh-runtime-capabilities ()
+  "Describe configured ownership semantics, not Host or model liveness.
+This performs no authentication, Host startup, session activation or stop."
+  (let ((mode (emacs-dsh--effective-mode)))
+    (list :mode mode :quit 'detach :finish-session nil
+          :configured-persistence (or (eq mode 'desktop)
+                                      (and (eq mode 'managed) emacs-dsh-managed-persistent))
+          :ownership (pcase mode ('desktop 'external)
+                            ('managed (if emacs-dsh-managed-persistent 'independent 'emacs))
+                            (_ 'unknown))
+          :shutdown-host (and (eq mode 'managed) emacs-dsh-managed-persistent)
+          :activity 'unknown)))
+
+;;;###autoload
+(cl-defun emacs-dsh-inspect-host (on-success &key on-error)
+  "Inspect the existing selected Host without startup or session activation.
+ON-SUCCESS receives (:status \"running\" :source IDENTITY :capabilities PLIST
+:sessions ROWS :activity unknown :coverage listed-only).  Rows contain only
+:session-id, :backend-state and :activity.  Explicit Host running=true means
+present, NOT model generation; running=false means not-running, NOT proven
+idle (pending work/approvals are not ruled out).  Missing data is unknown.
+No transcript, launch URL, cookie or token is returned.  Failure is unknown,
+not proof of absence.  Return a silent cancellation function."
+  (let* ((capabilities (emacs-dsh-runtime-capabilities))
+         (mode (plist-get capabilities :mode)) done cancel)
+    (cl-labels
+        ((fail ()
+           (unless done
+             (setq done t)
+             (when on-error (funcall on-error "Existing DSH Host runtime state is unknown; no Host was started")))))
+      (condition-case nil
+          (setq cancel
+                (emacs-dsh-list-sessions
+                 (lambda (result)
+                   (unless done
+                     (condition-case nil
+                         (if (not (eq mode (emacs-dsh--effective-mode))) (fail)
+                       (let ((source (plist-get result :source)) rows invalid)
+                         (dolist (item (append (plist-get result :items) nil))
+                           (let ((id (alist-get 'sessionId item)) (running (assq 'running item)))
+                             (if (not (and (stringp id) (not (string-empty-p id)))) (setq invalid t)
+                               (push (list :session-id id :activity 'unknown
+                                           :backend-state (cond ((and running (eq (cdr running) t)) 'present)
+                                                                ((and running (null (cdr running))) 'not-running)
+                                                                (t 'unknown))) rows))))
+                         (if (or invalid (not (and (listp source) (= (length source) 3)
+                                                  (stringp (car source)) (stringp (cadr source))
+                                                  (eq (nth 2 source) mode))))
+                             (fail)
+                           (setq done t)
+                           (funcall on-success (list :status "running" :source source
+                                                     :capabilities capabilities :sessions (nreverse rows)
+                                                     :activity 'unknown :coverage 'listed-only)))))
+                       (error (fail)))))
+                 :on-error (lambda (_failure) (fail))))
+        (error (fail)))
+      (lambda ()
+        (unless done
+          (setq done t)
+          (when (functionp cancel) (funcall cancel)))))))
+
+(defun emacs-dsh--passive-activity (value)
+  "Validate typed native wait VALUE and project counts, never input contents."
+  (let* ((state (alist-get 'state value)) (reason (alist-get 'reason value))
+         (active (alist-get 'active state)) (running (alist-get 'running state))
+         (queue (alist-get 'queue state)) (pending (alist-get 'pendingInput state))
+         (cursor (alist-get 'cursor state)))
+    (unless (and (member reason '("idle" "input-required" "timeout"))
+                 (integerp cursor) (>= cursor -1)
+                 (memq active '(t :json-false)) (memq running '(t :json-false))
+                 (assq 'queue state) (or (eq queue :json-null)
+                                        (and (vectorp queue)
+                                             (seq-every-p (lambda (item)
+                                                            (member (alist-get 'placement item) '("queued" "steering" "context"))) queue)))
+                 (vectorp pending) (seq-every-p (lambda (kind) (member kind '("approval" "question" "other"))) pending)
+                 (if (eq active t) (vectorp queue) (and (eq queue :json-null) (eq running :json-false))))
+      (error "Incomplete native passive state"))
+    (let* ((context (if (vectorp queue) (seq-count (lambda (item) (equal (alist-get 'placement item) "context")) queue) 0))
+           (queued (- (if (vectorp queue) (length queue) 0) context)) (waiting (length pending)))
+      (list :activity (cond ((> waiting 0) 'input-required)
+                            ((or (eq running t) (> queued 0)) 'busy)
+                            ((equal reason "idle") 'idle) (t 'unknown))
+            :active (eq active t) :running (eq running t)
+            :queue-count queued :context-count context :pending-input-count waiting :cursor cursor))))
+
+;;;###autoload
+(cl-defun emacs-dsh-inspect-session-activity (session-id on-success &key on-error)
+  "Read a bounded native quiescence sample for exact SESSION-ID.
+Uses existing Host authentication and passive session/wait only: no startup,
+activation, chat claim, prompt, approval reply, cancel or finish.  A future
+exclusive output cursor suppresses assistant dialogue in the native result.
+ON-SUCCESS receives sanitized :source, :session-id, :activity (idle/busy/
+input-required/unknown), booleans and counts.  Only an explicit native idle
+reason with complete typed empty actionable queue/input state proves idle
+at this cut.  Dormant context-only items are counted separately; only native
+whenIdle quiescence, never their presence alone, allows the idle result.
+Missing/unsupported fields fail unknown via ON-ERROR.  Cancel is silent and
+closes only this read; native wait cancellation never cancels execution."
+  (unless (and (stringp session-id) (not (string-empty-p session-id)))
+    (user-error "An exact session ID is required"))
+  (let (done timer request-buffer)
+    (cl-labels
+        ((finish (value failure)
+           (unless done
+             (setq done t)
+             (when timer (cancel-timer timer))
+             (when (buffer-live-p request-buffer) (kill-buffer request-buffer))
+             (if failure
+                 (when on-error (funcall on-error "DSH passive activity could not be verified; no session was activated"))
+               (funcall on-success value)))))
+      (setq timer (run-at-time 4 nil #'finish nil t))
+      (emacs-dsh--metadata-auth
+       (lambda (failure)
+         (unless done
+           (if failure (finish nil t)
+             (let ((source (emacs-dsh--source-identity)))
+               (condition-case nil
+                   (setq request-buffer
+                         (emacs-dsh--request
+                          "session/wait" `((request . ((sessionId . ,session-id) (timeoutMs . 250)
+                                                       (afterSeq . 9007199254740991) (maxMessages . 1))))
+                          (lambda (value error)
+                            (unless done
+                              (let ((projection (condition-case nil (emacs-dsh--passive-activity value) (error nil))))
+                                (if (or error (not projection) (not (equal source (emacs-dsh--source-identity))))
+                                    (finish nil t)
+                                  (finish (append (list :source source :session-id session-id) projection) nil))))) t))
+                 (error (finish nil t))))))))
+      (lambda ()
+        (unless done
+          (setq done t)
+          (when timer (cancel-timer timer))
+          (when (buffer-live-p request-buffer) (kill-buffer request-buffer)))))))
+
 ;;;###autoload
 (cl-defun emacs-dsh-open-session
     (session-id &key directory (display 'current) on-ready on-error)
@@ -736,8 +952,7 @@ A missing snapshot ID or cwd is an error, never assumed successful."
                    (let ((id (car emacs-dsh--verified-session))
                          (cwd (cadr emacs-dsh--verified-session)))
                      (if (and (equal id session-id) (stringp cwd)
-                              (equal (directory-file-name (emacs-dsh--host-path root))
-                                     (directory-file-name cwd))
+                              (emacs-dsh--same-host-directory-p (emacs-dsh--host-path root) cwd)
                               emacs-dsh--socket
                               (websocket-openp emacs-dsh--socket))
                          (finish buffer nil)
